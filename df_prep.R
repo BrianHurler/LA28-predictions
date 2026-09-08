@@ -43,6 +43,9 @@ if (!on_ec2) {
 # - Therefore all matches played by a team on the same date intentionally use
 #   the same pre-day Elo. Later matches that day are slightly stale, but never
 #   contain information from that day's outcomes.
+# - On a team's first observed playing date in performance_data, there is no
+#   earlier rating available. Those matches receive the Elo system's starting
+#   value of 1500.
 # =============================================================================
 
 tmp_performance <- tempfile(fileext = ".qs")
@@ -103,6 +106,11 @@ if (nrow(service_rows_all) == 0) {
 # First create one team rating per team/date. Then lag within team. Because the
 # lag is across DISTINCT dates, every match on a given day receives the rating
 # from that team's most recent earlier playing date.
+#
+# On the first observed playing date for a team, elo_pre_day is set to 1500.
+# This is intentionally a first-DAY flag: if the same team plays twice on its
+# first observed date, both matches use 1500 because our leakage-free convention
+# ignores all same-day Elo movement.
 # =============================================================================
 
 team_day_elos <- bind_rows(
@@ -141,8 +149,11 @@ team_day_elos <- team_day_elos %>%
   arrange(team, date) %>%
   group_by(team) %>%
   mutate(
+    first_observed_date = first(date),
+    first_observed_day = date == first_observed_date,
     prior_date = lag(date),
-    elo_pre_day = lag(elo_on_date)
+    elo_pre_day = lag(elo_on_date),
+    elo_pre_day = if_else(first_observed_day, 1500, elo_pre_day)
   ) %>%
   ungroup()
 
@@ -261,7 +272,8 @@ team_a_prior_elo <- team_day_elos %>%
     date,
     team_a = team,
     team_a_elo_pre = elo_pre_day,
-    team_a_elo_source_date = prior_date
+    team_a_elo_source_date = prior_date,
+    team_a_first_observed_day = first_observed_day
   )
 
 team_b_prior_elo <- team_day_elos %>%
@@ -269,7 +281,8 @@ team_b_prior_elo <- team_day_elos %>%
     date,
     team_b = team,
     team_b_elo_pre = elo_pre_day,
-    team_b_elo_source_date = prior_date
+    team_b_elo_source_date = prior_date,
+    team_b_first_observed_day = first_observed_day
   )
 
 # =============================================================================
@@ -301,6 +314,8 @@ model_df <- match_base %>%
     team_b_elo_pre,
     team_a_elo_source_date,
     team_b_elo_source_date,
+    team_a_first_observed_day,
+    team_b_first_observed_day,
     team_a_offense_elo_pre,
     team_b_offense_elo_pre,
     team_a_defense_elo_pre,
@@ -330,8 +345,10 @@ cat(
   sep = ""
 )
 cat("Missing outcome: ", sum(is.na(model_df$team_a_win)), "\n", sep = "")
-cat("Missing prior-day match Elo A: ", sum(is.na(model_df$team_a_elo_pre)), "\n", sep = "")
-cat("Missing prior-day match Elo B: ", sum(is.na(model_df$team_b_elo_pre)), "\n", sep = "")
+cat("Team A first-observed-day rows (Elo = 1500): ", sum(model_df$team_a_first_observed_day, na.rm = TRUE), "\n", sep = "")
+cat("Team B first-observed-day rows (Elo = 1500): ", sum(model_df$team_b_first_observed_day, na.rm = TRUE), "\n", sep = "")
+cat("Missing prior-day match Elo A after first-day initialization: ", sum(is.na(model_df$team_a_elo_pre)), "\n", sep = "")
+cat("Missing prior-day match Elo B after first-day initialization: ", sum(is.na(model_df$team_b_elo_pre)), "\n", sep = "")
 cat("Missing offense Elo A: ", sum(is.na(model_df$team_a_offense_elo_pre)), "\n", sep = "")
 cat("Missing offense Elo B: ", sum(is.na(model_df$team_b_offense_elo_pre)), "\n", sep = "")
 cat("Missing defense Elo A: ", sum(is.na(model_df$team_a_defense_elo_pre)), "\n", sep = "")
