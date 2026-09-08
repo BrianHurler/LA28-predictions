@@ -9,8 +9,9 @@ The repository is organized as a sequential modeling workflow:
 1. `01_df_prep.R` — build and QA the historical match-level modeling dataset.
 2. `02_model_validation.R` — compare candidate match-win models using chronological out-of-time validation.
 3. `03_production_model.R` — fit the selected V0 model on the full usable historical dataset and save the fitted model for downstream simulation.
+4. `04_current_field.R` — build the provisional 24-team field for each gender from current/latest Elo state, subject to a maximum of two teams per federation.
 
-Future scripts will continue this numbering for current-field construction and tournament simulation.
+Future scripts will continue this numbering for pairwise win probabilities and tournament simulation.
 
 ## Modeling architecture
 
@@ -129,6 +130,12 @@ This fitted model is the input to the next stage: constructing the current compe
 
 The LA28 qualification pathway is not yet known in final detail, so the first simulator uses a deliberately simple provisional field.
 
+`04_current_field.R` builds that field from current production data. Historical model fitting uses leakage-safe pre-match ratings, but future-match prediction uses each partnership's **latest known state**:
+
+- current overall Elo from the latest `team_elo_on_date` in `performance_data.qs`;
+- current offense and defense Elo from `off_def_elo_ratings.rda`, using the mean of the two partners' player ratings where available;
+- latest observed federation and partnership identifiers from `performance_data.qs`.
+
 For **each gender separately**:
 
 1. Take each team's most recent Elo score.
@@ -136,6 +143,15 @@ For **each gender separately**:
 3. Select the top 24 teams, subject to a maximum of **two teams per federation/country**.
 4. Ignore continental qualification pathways for V0.
 5. Seed the selected teams 1 through 24 by Elo.
+
+The script saves:
+
+```text
+data/current_team_state.qs
+data/current_field.qs
+```
+
+No activity cutoff is imposed in V0. `last_observed_date` is retained in the field output so stale or inactive partnerships can be identified and, if necessary, handled through an explicit documented rule rather than manual removal.
 
 This is a modeling assumption, not a prediction of the official LA28 qualification system.
 
@@ -202,7 +218,7 @@ Paris 2024 did not simply seed the 16 surviving teams 1 through 16 by record. It
 The two Lucky Loser winners are randomly drawn into seeds 15 and 16, subject to the no-rematch rule:
 
 - a Lucky Loser winner originally from Pool A cannot be seed 16, because seed 16 plays Pool A's winner;
-- a Lucky Loser winner originally from Pool B cannot be seed 15, because seed 15 plays Pool B's winner.
+- a Lucky Loser winner from Pool B cannot be seed 15, because seed 15 plays Pool B's winner.
 
 ### Seeds 13-14: directly advancing third-place teams
 
