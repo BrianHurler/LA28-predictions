@@ -5,24 +5,11 @@ library(qs2)
 on_ec2 <- file.exists("/sys/hypervisor/uuid") ||
   file.exists("/sys/devices/virtual/dmi/id/product_uuid")
 
-if (!on_ec2) {
-  # Running locally (RStudio laptop)
-  Sys.setenv(
-    AWS_PROFILE = "brian-hurler",
-    AWS_DEFAULT_REGION = "us-west-1"
-  )
-} else {
-  # Running on EC2
-  # DO NOT set AWS_PROFILE
-  Sys.setenv(
-    AWS_DEFAULT_REGION = "us-west-1"
-  )
-}
+
 
 # =============================================================================
 # Load canonical production dataset
 # =============================================================================
-#
 # performance_data.qs is the canonical cleaned analytical dataset produced by
 # the beach pipeline. Upstream cleaning therefore stays in one place rather
 # than being reimplemented independently in this repo.
@@ -37,16 +24,36 @@ if (!on_ec2) {
 #   contains information from that day's outcomes.
 # =============================================================================
 
-tmp <- tempfile(fileext = ".qs")
 
-save_object(
-  object = "performance_data.qs",
-  bucket = "usavbeach",
-  file = tmp
-)
 
-performance_data <- qs_read(tmp)
-unlink(tmp)
+if (!on_ec2) {
+  # Running locally (RStudio laptop)
+  Sys.setenv(
+    AWS_PROFILE = "brian-hurler",
+    AWS_DEFAULT_REGION = "us-west-1"
+  )
+  
+  tmp <- tempfile(fileext = ".qs")
+  
+  save_object(
+    object = "performance_data.qs",
+    bucket = "usavbeach",
+    file = tmp
+  )
+  
+  performance_data <- qs_read(tmp)
+  unlink(tmp)
+  
+} else {
+  # Running on EC2
+  # DO NOT set AWS_PROFILE
+  Sys.setenv(
+    AWS_DEFAULT_REGION = "us-west-1"
+  )
+  performance_data <- qs_read("/Users/brianhurler/Desktop/performance_data.qs")
+  
+}
+
 
 min_date <- as.Date("2023-01-01")
 
