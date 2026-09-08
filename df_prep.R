@@ -80,11 +80,6 @@ first_non_missing <- function(x) {
 # =============================================================================
 # 1. Keep one row per rally from performance_data: the service row
 # =============================================================================
-#
-# performance_data is already cleaned upstream. One service row corresponds to
-# one rally, which lets us collapse outcomes and points without weighting rallies
-# by their number of touches.
-# =============================================================================
 
 service_rows_all <- performance_data %>%
   filter(touch_type == "service") %>%
@@ -97,20 +92,6 @@ if (nrow(service_rows_all) == 0) {
 
 # =============================================================================
 # 2. Build leakage-free prior-day match Elo
-# =============================================================================
-#
-# performance_data contains both sides' daily Elo on every service row:
-# - touch_team_name / team_elo_on_date = serving side
-# - opponent / opp_elo_on_date         = receiving side
-#
-# First create one team rating per team/date. Then lag within team. Because the
-# lag is across DISTINCT dates, every match on a given day receives the rating
-# from that team's most recent earlier playing date.
-#
-# On the first observed playing date for a team, elo_pre_day is set to 1500.
-# This is intentionally a first-DAY flag: if the same team plays twice on its
-# first observed date, both matches use 1500 because our leakage-free convention
-# ignores all same-day Elo movement.
 # =============================================================================
 
 team_day_elos <- bind_rows(
@@ -188,10 +169,6 @@ if (anyDuplicated(match_base$match_id) > 0) {
 # =============================================================================
 # 4. Point differential from cleaned performance_data rally winners
 # =============================================================================
-#
-# Because service_rows_all has exactly one row per rally, counting rally winners
-# is equivalent to counting points won.
-# =============================================================================
 
 rally_points <- service_rows_all %>%
   filter(date >= min_date) %>%
@@ -214,35 +191,37 @@ rally_points <- service_rows_all %>%
 # Offense Elo changes only when a team receives; defense Elo changes only when a
 # team serves. Therefore the first observed value for each team/role inside a
 # match is still that team's true pre-match rating for that component.
-#
-# performance_data determines the match universe. The raw rally-Elo table only
-# contributes these four predictor fields through the shared BeachData match_id.
 # =============================================================================
 
-raw_rally_elos <- rallies_with_off_def_elo %>%
+rally_elo_base <- rallies_with_off_def_elo %>%
   mutate(date = as.Date(date)) %>%
   filter(date >= min_date) %>%
-  semi_join(match_base %>% select(match_id), by = "match_id") %>%
-  bind_rows(
-    . %>%
-      transmute(
-        match_id,
-        set_num,
-        rally_num,
-        team_num = if_else(serving_team_num == 1L, 2L, 1L),
-        offense_elo,
-        defense_elo = NA_real_
-      ),
-    . %>%
-      transmute(
-        match_id,
-        set_num,
-        rally_num,
-        team_num = as.integer(serving_team_num),
-        offense_elo = NA_real_,
-        defense_elo
-      )
-  ) %>%
+  semi_join(match_base %>% select(match_id), by = "match_id")
+
+rally_offense_rows <- rally_elo_base %>%
+  transmute(
+    match_id,
+    set_num,
+    rally_num,
+    team_num = if_else(serving_team_num == 1L, 2L, 1L),
+    offense_elo,
+    defense_elo = NA_real_
+  )
+
+rally_defense_rows <- rally_elo_base %>%
+  transmute(
+    match_id,
+    set_num,
+    rally_num,
+    team_num = as.integer(serving_team_num),
+    offense_elo = NA_real_,
+    defense_elo
+  )
+
+raw_rally_elos <- bind_rows(
+  rally_offense_rows,
+  rally_defense_rows
+) %>%
   arrange(match_id, set_num, rally_num) %>%
   group_by(match_id, team_num) %>%
   summarise(
