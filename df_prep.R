@@ -5,26 +5,9 @@ library(qs2)
 on_ec2 <- file.exists("/sys/hypervisor/uuid") ||
   file.exists("/sys/devices/virtual/dmi/id/product_uuid")
 
-
-
 # =============================================================================
-# Load canonical production dataset
+# AWS setup
 # =============================================================================
-# performance_data.qs is the canonical cleaned analytical dataset produced by
-# the beach pipeline. Upstream cleaning therefore stays in one place rather
-# than being reimplemented independently in this repo.
-#
-# Important Elo convention for this model:
-# - performance_data$team_elo_on_date / opp_elo_on_date represent the final
-#   daily Elo state attached by the production pipeline.
-# - To avoid same-day leakage, match Elo below uses the latest rating from a
-#   STRICTLY EARLIER DATE.
-# - Therefore all matches played by a team on the same date intentionally use
-#   the same pre-day Elo. A second match that day is slightly stale, but never
-#   contains information from that day's outcomes.
-# =============================================================================
-
-
 
 if (!on_ec2) {
   # Running locally (RStudio laptop)
@@ -32,47 +15,72 @@ if (!on_ec2) {
     AWS_PROFILE = "brian-hurler",
     AWS_DEFAULT_REGION = "us-west-1"
   )
-  
-  tmp <- tempfile(fileext = ".qs")
-  
-  save_object(
-    object = "performance_data.qs",
-    bucket = "usavbeach",
-    file = tmp
-  )
-  
-  performance_data <- qs_read(tmp)
-  unlink(tmp)
-  
 } else {
   # Running on EC2
   # DO NOT set AWS_PROFILE
   Sys.setenv(
     AWS_DEFAULT_REGION = "us-west-1"
   )
-  performance_data <- qs_read("/Users/brianhurler/Desktop/performance_data.qs")
-  
 }
 
+# =============================================================================
+# Load source data
+# =============================================================================
+#
+# performance_data.qs is the canonical cleaned analytical dataset produced by
+# the beach pipeline. It determines which matches enter this model and supplies
+# match metadata, outcomes, points, and daily match Elo.
+#
+# rallies_with_off_def_elo.rda is used ONLY for rally-based offense / defense
+# Elo. It shares BeachData match_id with performance_data, so no cross-system
+# match mapping is required.
+#
+# Match-Elo convention:
+# - performance_data$team_elo_on_date / opp_elo_on_date represent the final
+#   daily Elo state attached by the production pipeline.
+# - To avoid same-day leakage, match Elo below uses the latest rating from a
+#   STRICTLY EARLIER DATE.
+# - Therefore all matches played by a team on the same date intentionally use
+#   the same pre-day Elo. Later matches that day are slightly stale, but never
+#   contain information from that day's outcomes.
+# =============================================================================
+
+tmp_performance <- tempfile(fileext = ".qs")
+save_object(
+  object = "performance_data.qs",
+  bucket = "usavbeach",
+  file = tmp_performance
+)
+performance_data <- qs_read(tmp_performance)
+unlink(tmp_performance)
+
+tmp_rally_elo <- tempfile(fileext = ".rda")
+save_object(
+  object = "rallies_with_off_def_elo.rda",
+  bucket = "usavbeach",
+  file = tmp_rally_elo
+)
+load(tmp_rally_elo)
+unlink(tmp_rally_elo)
 
 min_date <- as.Date("2023-01-01")
 
 # =============================================================================
-# 1. Keep one row per rally: the service row
+# Helpers
+# =============================================================================
+
+first_non_missing <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) NA_real_ else x[[1]]
+}
+
+# =============================================================================
+# 1. Keep one row per rally from performance_data: the service row
 # =============================================================================
 #
-# One service row corresponds to one rally and carries:
-# - match / tournament metadata
-# - rally winner
-# - serving team in touch_team_name
-# - receiving team in opponent
-# - team_elo_on_date for the serving team
-# - opp_elo_on_date for the receiving team
-# - offense_elo for the receiving side BEFORE the rally
-# - defense_elo for the serving side BEFORE the rally
-#
-# Using service rows makes the match-level collapse simple and avoids weighting
-# rallies by their number of touches.
+# performance_data is already cleaned upstream. One service row corresponds to
+# one rally, which lets us collapse outcomes and points without weighting rallies
+# by their number of touches.
 # =============================================================================
 
 service_rows_all <- performance_data %>%
@@ -167,7 +175,7 @@ if (anyDuplicated(match_base$match_id) > 0) {
 }
 
 # =============================================================================
-# 4. Point differential from rally winners
+# 4. Point differential from cleaned performance_data rally winners
 # =============================================================================
 #
 # Because service_rows_all has exactly one row per rally, counting rally winners
@@ -185,45 +193,64 @@ rally_points <- service_rows_all %>%
   )
 
 # =============================================================================
-# 5. Exact pre-match rally offense / defense Elo
+# 5. Exact pre-match rally offense / defense Elo from original rally table
 # =============================================================================
 #
-# On a service row:
-# - defense_elo belongs to touch_team_name (the serving team)
-# - offense_elo belongs to opponent        (the receiving team)
+# rallies_with_off_def_elo stores one row per rally:
+# - offense_elo = receiving side's offense Elo BEFORE that rally
+# - defense_elo = serving side's defense Elo BEFORE that rally
 #
-# The first time a team serves in a match gives its pre-match defense Elo.
-# The first time a team receives in a match gives its pre-match offense Elo.
+# Offense Elo changes only when a team receives; defense Elo changes only when a
+# team serves. Therefore the first observed value for each team/role inside a
+# match is still that team's true pre-match rating for that component.
+#
+# performance_data determines the match universe. The raw rally-Elo table only
+# contributes these four predictor fields through the shared BeachData match_id.
 # =============================================================================
 
-rally_elos <- service_rows_all %>%
+raw_rally_elos <- rallies_with_off_def_elo %>%
+  mutate(date = as.Date(date)) %>%
   filter(date >= min_date) %>%
-  group_by(match_id) %>%
+  semi_join(match_base %>% select(match_id), by = "match_id") %>%
+  bind_rows(
+    . %>%
+      transmute(
+        match_id,
+        set_num,
+        rally_num,
+        team_num = if_else(serving_team_num == 1L, 2L, 1L),
+        offense_elo,
+        defense_elo = NA_real_
+      ),
+    . %>%
+      transmute(
+        match_id,
+        set_num,
+        rally_num,
+        team_num = as.integer(serving_team_num),
+        offense_elo = NA_real_,
+        defense_elo
+      )
+  ) %>%
+  arrange(match_id, set_num, rally_num) %>%
+  group_by(match_id, team_num) %>%
   summarise(
-    team_a = first(team1_name),
-    team_b = first(team2_name),
-
-    team_a_offense_elo_pre = first(
-      offense_elo[opponent == first(team1_name) & !is.na(offense_elo)],
-      default = NA_real_
-    ),
-    team_b_offense_elo_pre = first(
-      offense_elo[opponent == first(team2_name) & !is.na(offense_elo)],
-      default = NA_real_
-    ),
-
-    team_a_defense_elo_pre = first(
-      defense_elo[touch_team_name == first(team1_name) & !is.na(defense_elo)],
-      default = NA_real_
-    ),
-    team_b_defense_elo_pre = first(
-      defense_elo[touch_team_name == first(team2_name) & !is.na(defense_elo)],
-      default = NA_real_
-    ),
-
+    offense_elo_pre = first_non_missing(offense_elo),
+    defense_elo_pre = first_non_missing(defense_elo),
     .groups = "drop"
   ) %>%
-  select(-team_a, -team_b)
+  filter(team_num %in% c(1L, 2L)) %>%
+  pivot_wider(
+    names_from = team_num,
+    values_from = c(offense_elo_pre, defense_elo_pre),
+    names_glue = "{.value}_team{team_num}"
+  ) %>%
+  rename(
+    team_a_offense_elo_pre = offense_elo_pre_team1,
+    team_b_offense_elo_pre = offense_elo_pre_team2,
+    team_a_defense_elo_pre = defense_elo_pre_team1,
+    team_b_defense_elo_pre = defense_elo_pre_team2
+  )
 
 # =============================================================================
 # 6. Attach prior-day team Elo
@@ -251,7 +278,7 @@ team_b_prior_elo <- team_day_elos %>%
 
 model_df <- match_base %>%
   left_join(rally_points, by = "match_id") %>%
-  left_join(rally_elos, by = "match_id") %>%
+  left_join(raw_rally_elos, by = "match_id") %>%
   left_join(
     team_a_prior_elo,
     by = c("date", "team_a")
@@ -291,7 +318,8 @@ if (anyDuplicated(model_df$match_id) > 0) {
 
 cat("\nLA28 model dataframe QA\n")
 cat("=======================\n")
-cat("Source: performance_data.qs\n")
+cat("Canonical match source: performance_data.qs\n")
+cat("Rally Elo source: rallies_with_off_def_elo.rda\n")
 cat("Rows: ", format(nrow(model_df), big.mark = ","), "\n", sep = "")
 cat(
   "Date range: ",
