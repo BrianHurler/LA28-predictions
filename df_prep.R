@@ -46,6 +46,12 @@ save_object(
 )
 load("long_matches_k_factor_30.rda")
 
+min_date = "2023-01-01"
+
+long_matches <- long_matches %>% filter(date > min_date)
+rallies_with_off_def_elo <- rallies_with_off_def_elo %>% filter(date >= min_date)
+matches <- matches %>% filter(date_from > min_date)
+
 # =============================================================================
 # Helpers
 # =============================================================================
