@@ -25,17 +25,21 @@ if (!on_ec2) {
 # leakage-safe historical pre-match values used for model training.
 # =============================================================================
 
-if (on_ec2) {
-  tmp_performance <- tempfile(fileext = ".qs")
-  save_object(
-    object = "performance_data.qs",
-    bucket = "usavbeach",
-    file = tmp_performance
-  )
-  performance_data <- qs_read(tmp_performance)
-  unlink(tmp_performance)
+if (!exists("performance_data")) {
+  if (on_ec2) {
+    tmp_performance <- tempfile(fileext = ".qs")
+    save_object(
+      object = "performance_data.qs",
+      bucket = "usavbeach",
+      file = tmp_performance
+    )
+    performance_data <- qs_read(tmp_performance)
+    unlink(tmp_performance)
+  } else {
+    performance_data <- qs_read("/Users/brianhurler/Desktop/performance_data.qs")
+  }
 } else {
-  performance_data <- qs_read("/Users/brianhurler/Desktop/performance_data.qs")
+  message("performance_data already loaded; skipping reload.")
 }
 
 tmp_ratings <- tempfile(fileext = ".rda")
