@@ -140,7 +140,45 @@ team_day_elos <- team_day_elos %>%
   ungroup()
 
 # =============================================================================
-# 3. One row per cleaned match
+# 3. Federation QA from cleaned service rows
+# =============================================================================
+# Federation is needed for the provisional Olympic field rule (maximum two teams
+# per federation). Surface team/federation conflicts now, but do not stop model
+# development; these should ultimately be repaired upstream in the pipeline.
+# =============================================================================
+
+team_federation_history <- service_rows_all %>%
+  transmute(
+    date,
+    team = as.character(touch_team_name),
+    federation = as.character(federation)
+  ) %>%
+  filter(
+    !is.na(team), team != "",
+    !is.na(federation), federation != ""
+  ) %>%
+  distinct(team, federation)
+
+team_federation_conflicts <- team_federation_history %>%
+  group_by(team) %>%
+  summarise(
+    n_federations = n_distinct(federation),
+    federations = paste(sort(unique(federation)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_federations > 1L) %>%
+  arrange(desc(n_federations), team)
+
+if (nrow(team_federation_conflicts) > 0) {
+  warning(
+    nrow(team_federation_conflicts),
+    " teams are associated with multiple federations in performance_data. ",
+    "See team_federation_conflicts."
+  )
+}
+
+# =============================================================================
+# 4. One row per cleaned match
 # =============================================================================
 
 match_base <- service_rows_all %>%
@@ -174,7 +212,7 @@ if (anyDuplicated(match_base$match_id) > 0) {
 }
 
 # =============================================================================
-# 4. Point differential from cleaned performance_data rally winners
+# 5. Point differential from cleaned performance_data rally winners
 # =============================================================================
 
 rally_points <- service_rows_all %>%
@@ -188,7 +226,7 @@ rally_points <- service_rows_all %>%
   )
 
 # =============================================================================
-# 5. Exact pre-match offense / defense Elo from original rally table
+# 6. Exact pre-match offense / defense Elo from original rally table
 # =============================================================================
 # offense_elo = receiving side's offense Elo before the rally
 # defense_elo = serving side's defense Elo before the rally
@@ -247,7 +285,7 @@ raw_rally_elos <- bind_rows(
   )
 
 # =============================================================================
-# 6. Attach prior-day team Elo
+# 7. Attach prior-day team Elo
 # =============================================================================
 
 team_a_prior_elo <- team_day_elos %>%
@@ -269,7 +307,7 @@ team_b_prior_elo <- team_day_elos %>%
   )
 
 # =============================================================================
-# 7. Assemble full match dataframe
+# 8. Assemble full match dataframe
 # =============================================================================
 
 model_df <- match_base %>%
@@ -306,8 +344,30 @@ if (anyDuplicated(model_df$match_id) > 0) {
   stop("model_df is not one row per match_id.")
 }
 
+# Match-level federation consistency: a given team should not carry multiple
+# federation labels across model_df.
+model_team_federations <- bind_rows(
+  model_df %>% transmute(team = team_a, federation = team_a_federation),
+  model_df %>% transmute(team = team_b, federation = team_b_federation)
+) %>%
+  filter(
+    !is.na(team), team != "",
+    !is.na(federation), federation != ""
+  ) %>%
+  distinct(team, federation)
+
+model_team_federation_conflicts <- model_team_federations %>%
+  group_by(team) %>%
+  summarise(
+    n_federations = n_distinct(federation),
+    federations = paste(sort(unique(federation)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_federations > 1L) %>%
+  arrange(desc(n_federations), team)
+
 # =============================================================================
-# 8. Temporary model-ready population
+# 9. Temporary model-ready population
 # =============================================================================
 # Until upstream QA gates guarantee complete Elo coverage in performance_data,
 # model development uses complete cases only. model_df remains untouched for QA;
@@ -329,7 +389,7 @@ dir.create("data", showWarnings = FALSE, recursive = TRUE)
 qs_save(model_df_ready, "data/model_df_ready.qs")
 
 # =============================================================================
-# 9. QA
+# 10. QA
 # =============================================================================
 
 cat("\nLA28 model dataframe QA\n")
@@ -358,8 +418,15 @@ cat("Missing defense Elo A: ", sum(is.na(model_df$team_a_defense_elo_pre)), "\n"
 cat("Missing defense Elo B: ", sum(is.na(model_df$team_b_defense_elo_pre)), "\n", sep = "")
 cat("Missing federation A: ", sum(is.na(model_df$team_a_federation)), "\n", sep = "")
 cat("Missing federation B: ", sum(is.na(model_df$team_b_federation)), "\n", sep = "")
+cat("Teams with multiple federations (service-row QA): ", nrow(team_federation_conflicts), "\n", sep = "")
+cat("Teams with multiple federations (model_df QA): ", nrow(model_team_federation_conflicts), "\n", sep = "")
 cat("Missing point differential: ", sum(is.na(model_df$point_differential)), "\n", sep = "")
 cat("Team/date Elo inconsistencies: ", nrow(inconsistent_team_day_elos), "\n", sep = "")
+
+if (nrow(model_team_federation_conflicts) > 0) {
+  cat("\nFederation conflicts (first 20)\n")
+  print(head(model_team_federation_conflicts, 20))
+}
 
 cat("\nPrior-day Elo staleness (days since source rating)\n")
 cat("Team A median: ", median(as.integer(model_df$date - model_df$team_a_elo_source_date), na.rm = TRUE), "\n", sep = "")
