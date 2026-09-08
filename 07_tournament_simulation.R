@@ -7,6 +7,7 @@ library(qs2)
 
 N_SIM <- 10000L
 SIM_SEED <- 20260908L
+PROGRESS_EVERY <- 500L
 set.seed(SIM_SEED)
 
 # =============================================================================
@@ -425,13 +426,31 @@ cat("==========================\n")
 cat("Simulations per gender: ", format(N_SIM, big.mark = ","), "\n", sep = "")
 cat("Random seed: ", SIM_SEED, "\n", sep = "")
 cat("Pairwise coverage QA: complete for all current-field directed matchups\n")
+cat("Progress updates every ", format(PROGRESS_EVERY, big.mark = ","), " simulations\n", sep = "")
 
 simulation_results <- map_dfr(c("female", "male"), function(g) {
   cat("Running ", g, " simulations...\n", sep = "")
 
   map_dfr(seq_len(N_SIM), function(sim_id) {
-    simulate_gender_tournament(g) %>%
+    result <- simulate_gender_tournament(g) %>%
       mutate(gender = g, simulation = sim_id)
+
+    if (sim_id %% PROGRESS_EVERY == 0L || sim_id == N_SIM) {
+      cat(
+        g,
+        ": ",
+        format(sim_id, big.mark = ","),
+        " / ",
+        format(N_SIM, big.mark = ","),
+        " (",
+        round(100 * sim_id / N_SIM, 1),
+        "%) complete\n",
+        sep = ""
+      )
+      flush.console()
+    }
+
+    result
   })
 })
 
