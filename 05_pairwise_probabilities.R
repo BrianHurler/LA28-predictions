@@ -189,21 +189,37 @@ if (any(pairwise_probabilities$win_probability <= 0 | pairwise_probabilities$win
   stop("Pairwise win probabilities must be strictly between 0 and 1.")
 }
 
+# Build reverse keys using temporary names. In dplyr::transmute(), newly created
+# columns are immediately available to later expressions, so directly writing
+# team_a = team_b followed by team_b = team_a would accidentally overwrite the
+# original team_a before the second assignment is evaluated.
+reverse_probability_lookup <- pairwise_probabilities %>%
+  transmute(
+    gender,
+    original_team_a = team_a,
+    original_team_b = team_b,
+    p_ba = win_probability
+  ) %>%
+  transmute(
+    gender,
+    team_a = original_team_b,
+    team_b = original_team_a,
+    p_ba
+  )
+
 symmetry_qa <- pairwise_probabilities %>%
   select(gender, team_a, team_b, p_ab = win_probability) %>%
   left_join(
-    pairwise_probabilities %>%
-      transmute(
-        gender,
-        team_a = team_b,
-        team_b = team_a,
-        p_ba = win_probability
-      ),
+    reverse_probability_lookup,
     by = c("gender", "team_a", "team_b")
   ) %>%
   mutate(symmetry_error = abs((p_ab + p_ba) - 1))
 
-max_symmetry_error <- max(symmetry_qa$symmetry_error, na.rm = TRUE)
+if (any(is.na(symmetry_qa$p_ba))) {
+  stop("Pairwise symmetry QA could not find a reverse probability for every matchup.")
+}
+
+max_symmetry_error <- max(symmetry_qa$symmetry_error)
 
 if (max_symmetry_error > 1e-12) {
   stop("Pairwise probability symmetry QA failed.")
