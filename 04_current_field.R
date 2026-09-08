@@ -83,6 +83,13 @@ service_rows <- performance_data %>%
   mutate(date = as.Date(date)) %>%
   arrange(date, match_id, set_num, rally_num)
 
+if (nrow(service_rows) == 0) {
+  stop("No service rows found in performance_data.qs.")
+}
+
+latest_data_date <- max(service_rows$date, na.rm = TRUE)
+activity_window_start <- latest_data_date - 364
+
 team_service_rows <- service_rows %>%
   mutate(
     team = as.character(touch_team_name),
@@ -133,7 +140,46 @@ current_team_state <- team_service_rows %>%
   )
 
 # =============================================================================
-# 2. Attach CURRENT offense and defense Elo
+# 2. Count recent partnership matches
+# =============================================================================
+# Field eligibility requires at least 15 matches in the most recent 365-day
+# window available in the dataset. Count distinct match_id values so each match
+# counts once regardless of number of sets or rallies.
+# =============================================================================
+
+team_match_history <- service_rows %>%
+  distinct(match_id, date, gender, team1_name, team2_name) %>%
+  transmute(
+    match_id,
+    date,
+    gender,
+    team_a = as.character(team1_name),
+    team_b = as.character(team2_name)
+  ) %>%
+  pivot_longer(
+    cols = c(team_a, team_b),
+    names_to = "side",
+    values_to = "team"
+  ) %>%
+  filter(!is.na(team), team != "") %>%
+  distinct(match_id, date, gender, team)
+
+recent_match_counts <- team_match_history %>%
+  filter(
+    date >= activity_window_start,
+    date <= latest_data_date
+  ) %>%
+  count(gender, team, name = "matches_last_365")
+
+current_team_state <- current_team_state %>%
+  left_join(recent_match_counts, by = c("gender", "team")) %>%
+  mutate(
+    matches_last_365 = replace_na(matches_last_365, 0L),
+    activity_eligible = matches_last_365 >= 15L
+  )
+
+# =============================================================================
+# 3. Attach CURRENT offense and defense Elo
 # =============================================================================
 # The rally Elo system tracks player-level offense and defense ratings whenever
 # player IDs are available. The team rating used by the model is the average of
@@ -204,6 +250,8 @@ current_team_state <- current_team_state %>%
     team,
     federation,
     last_observed_date,
+    matches_last_365,
+    activity_eligible,
     team_id,
     player1_id,
     player2_id,
@@ -214,20 +262,18 @@ current_team_state <- current_team_state %>%
   )
 
 # =============================================================================
-# 3. Build provisional 24-team Olympic field by gender
+# 4. Build provisional 24-team Olympic field by gender
 # =============================================================================
-# V0 field rule documented in README:
-#   1. Rank teams by most recent overall Elo.
-#   2. Maximum two teams per federation.
-#   3. Take the top 24 remaining teams for each gender.
-#
-# No activity cutoff is imposed yet. last_observed_date is retained so stale or
-# inactive partnerships are visible and can be handled with an explicit rule if
-# needed rather than an undocumented manual adjustment.
+# V0 field rule:
+#   1. Team must have played at least 15 matches in the last 365 days.
+#   2. Rank eligible teams by most recent overall Elo.
+#   3. Maximum two teams per federation.
+#   4. Take the top 24 remaining teams for each gender.
 # =============================================================================
 
 field_candidates <- current_team_state %>%
   filter(
+    activity_eligible,
     !is.na(overall_elo),
     !is.na(federation),
     federation != ""
@@ -250,6 +296,7 @@ current_field <- field_candidates %>%
     team,
     federation,
     last_observed_date,
+    matches_last_365,
     overall_elo,
     offense_elo,
     defense_elo,
@@ -263,7 +310,7 @@ field_counts <- current_field %>%
   count(gender, name = "n_teams")
 
 if (any(field_counts$n_teams < 24L)) {
-  warning("At least one gender has fewer than 24 eligible teams after federation filtering.")
+  warning("At least one gender has fewer than 24 eligible teams after activity and federation filtering.")
 }
 
 if (any(is.na(current_field$offense_elo)) || any(is.na(current_field$defense_elo))) {
@@ -274,7 +321,7 @@ if (any(is.na(current_field$offense_elo)) || any(is.na(current_field$defense_elo
 }
 
 # =============================================================================
-# 4. Save downstream inputs
+# 5. Save downstream inputs
 # =============================================================================
 
 dir.create("data", showWarnings = FALSE, recursive = TRUE)
@@ -282,12 +329,17 @@ qs_save(current_team_state, "data/current_team_state.qs")
 qs_save(current_field, "data/current_field.qs")
 
 # =============================================================================
-# 5. QA / inspection
+# 6. QA / inspection
 # =============================================================================
 
 cat("\nLA28 provisional current field\n")
 cat("==============================\n")
+cat("Latest data date: ", format(latest_data_date), "\n", sep = "")
+cat("365-day activity window: ", format(activity_window_start), " to ", format(latest_data_date), "\n", sep = "")
+cat("Minimum matches for field eligibility: 15\n")
 cat("Current team states: ", format(nrow(current_team_state), big.mark = ","), "\n", sep = "")
+cat("Activity-eligible teams: ", sum(current_team_state$activity_eligible), "\n", sep = "")
+cat("Teams excluded for <15 matches: ", sum(!current_team_state$activity_eligible), "\n", sep = "")
 cat("Teams with historical federation conflicts: ", nrow(current_federation_conflicts), "\n", sep = "")
 cat("Missing latest federation: ", sum(is.na(current_team_state$federation)), "\n", sep = "")
 cat("Missing latest overall Elo: ", sum(is.na(current_team_state$overall_elo)), "\n", sep = "")
@@ -311,6 +363,7 @@ print(
       team,
       federation,
       last_observed_date,
+      matches_last_365,
       overall_elo,
       offense_elo,
       defense_elo,
