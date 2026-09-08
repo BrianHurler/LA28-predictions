@@ -144,9 +144,6 @@ current_team_state <- team_service_rows %>%
 # =============================================================================
 # 2. Count recent partnership matches
 # =============================================================================
-# General field eligibility requires at least 15 distinct matches in the most
-# recent 365-day window. Known continental-berth teams bypass this threshold.
-# =============================================================================
 
 team_match_history <- service_rows %>%
   distinct(match_id, date, gender, team1_name, team2_name) %>%
@@ -260,20 +257,16 @@ current_team_state <- current_team_state %>%
 # =============================================================================
 # 4. Known continental berths
 # =============================================================================
-# These partnerships are locked into the provisional Olympic field regardless
-# of the 15-match activity threshold. The seven existing partnerships must be
-# present in current_team_state with federation and all three Elo ratings.
-# =============================================================================
 
 continental_berths_existing <- tribble(
-  ~berth_team,                       ~expected_gender,
-  "Andre/Renato",                   "male",
-  "Victoria/Thamela",               "female",
-  "Stam/Schoon",                    "female",
-  "Andersson, E/Hölting Nilsson",   "male",
-  "Nicolaidis/Carracher",           "male",
-  "Clancy/Fejes",                   "female",
-  "Pamela/Esther M",                "female"
+  ~berth_team,                     ~expected_gender, ~expected_federation,
+  "Andre/Renato",                 "male",          "BRA",
+  "Victoria/Thamela",             "female",        "BRA",
+  "Stam/Schoon",                  "female",        "NED",
+  "Andersson, E/Hölting Nilsson", "male",          "SWE",
+  "Nicolaidis/Carracher",         "male",          "AUS",
+  "Clancy/Fejes",                 "female",        "AUS",
+  "Pamela/Esther M",              "female",        "NGR"
 ) %>%
   mutate(team_key = normalize_team_label(berth_team))
 
@@ -285,8 +278,18 @@ continental_berth_qa <- continental_berths_existing %>%
   left_join(continental_lookup, by = "team_key") %>%
   mutate(
     found = !is.na(team),
+    federation_source = case_when(
+      !is.na(federation) & federation != "" ~ "data",
+      found ~ "known berth override",
+      TRUE ~ NA_character_
+    ),
+    federation = if_else(
+      found & (is.na(federation) | federation == ""),
+      expected_federation,
+      federation
+    ),
     gender_ok = found & gender == expected_gender,
-    federation_ok = found & !is.na(federation) & federation != "",
+    federation_ok = found & federation == expected_federation,
     overall_elo_ok = found & !is.na(overall_elo),
     offense_elo_ok = found & !is.na(offense_elo),
     defense_elo_ok = found & !is.na(defense_elo),
@@ -308,6 +311,8 @@ if (any(!continental_berth_qa$qa_pass)) {
         team,
         gender,
         federation,
+        expected_federation,
+        federation_source,
         overall_elo,
         offense_elo,
         defense_elo,
@@ -340,11 +345,15 @@ locked_existing <- continental_berth_qa %>%
     defense_elo,
     rally_elo_source,
     continental_berth = TRUE,
-    berth_source = "known continental berth"
+    berth_source = if_else(
+      federation_source == "known berth override",
+      "known continental berth - federation override",
+      "known continental berth"
+    )
   )
 
-# Morocco's continental berth is not represented as this partnership in the
-# current dataset. Use neutral 1500 ratings for all three model inputs.
+# Morocco's qualified partnership is absent from the dataset. Inject it manually
+# with neutral Elo values for every model input.
 locked_morocco <- tibble(
   gender = "male",
   team = "Elgraoui/El Gharouti",
@@ -374,13 +383,6 @@ if (any(locked_federation_counts$locked_federation_teams > 2L)) {
 
 # =============================================================================
 # 5. Build provisional 24-team Olympic field by gender
-# =============================================================================
-# Field rule:
-#   1. Lock all known continental berths into the field.
-#   2. For all other teams, require >=15 matches in the last 365 days.
-#   3. Known berths count toward the maximum of two teams per federation.
-#   4. Fill remaining slots by latest overall Elo.
-#   5. Seed the completed 24-team field by overall Elo.
 # =============================================================================
 
 locked_keys <- locked_existing %>%
@@ -506,6 +508,8 @@ print(
       team,
       gender,
       federation,
+      expected_federation,
+      federation_source,
       matches_last_365,
       overall_elo,
       offense_elo,
