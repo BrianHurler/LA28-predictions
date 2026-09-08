@@ -20,345 +20,242 @@ if (!on_ec2) {
 }
 
 # =============================================================================
-# Load source data
+# Load canonical production dataset
 # =============================================================================
-
-save_object(
-  object = "v25_structure/v25_matches.rda",
-  bucket = "usavbeach",
-  file = "v25_matches.rda"
-)
-load("v25_matches.rda")
-matches <- data
-rm(data)
-
-save_object(
-  object = "rallies_with_off_def_elo.rda",
-  bucket = "usavbeach",
-  file = "rallies_with_off_def_elo.rda"
-)
-load("rallies_with_off_def_elo.rda")
-
-save_object(
-  object = "elo/long_matches_k_factor_30.rda",
-  bucket = "usavbeach",
-  file = "long_matches_k_factor_30.rda"
-)
-load("long_matches_k_factor_30.rda")
-
-min_date = "2023-01-01"
-
-long_matches <- long_matches %>% filter(date > min_date)
-rallies_with_off_def_elo <- rallies_with_off_def_elo %>% filter(date >= min_date)
-matches <- matches %>% filter(date_from > min_date)
-
-# =============================================================================
-# Helpers
-# =============================================================================
-
-# Canonical two-player team key.
-# Player IDs are placed in TRUE numeric order so the same partnership always
-# receives the same key in BeachData and FIVB/VIS, regardless of player order.
-pair_key <- function(player1, player2) {
-  p1 <- suppressWarnings(as.numeric(player1))
-  p2 <- suppressWarnings(as.numeric(player2))
-
-  if_else(
-    is.na(p1) | is.na(p2),
-    NA_character_,
-    paste0(pmin(p1, p2), "|", pmax(p1, p2))
-  )
-}
-
-# Canonical matchup key. Team orientation does not matter here; the two already
-# canonicalized partnership keys are sorted so A-v-B == B-v-A.
-matchup_key <- function(pair1, pair2) {
-  if_else(
-    is.na(pair1) | is.na(pair2),
-    NA_character_,
-    map2_chr(
-      pair1,
-      pair2,
-      ~ paste(sort(c(.x, .y)), collapse = "__VS__")
-    )
-  )
-}
-
-normalize_gender <- function(x) {
-  case_when(
-    str_to_lower(as.character(x)) %in% c("female", "women", "woman", "w") ~ "W",
-    str_to_lower(as.character(x)) %in% c("male", "men", "man", "m") ~ "M",
-    TRUE ~ as.character(x)
-  )
-}
-
-# Tournament names are retained only for QA. BeachData tournament labels are
-# intentionally user-friendly and therefore are NOT used as a required
-# cross-system match key.
-normalize_tournament <- function(x) {
-  x %>%
-    as.character() %>%
-    str_to_lower() %>%
-    str_replace_all("[^a-z0-9]", "")
-}
-
-first_non_missing <- function(x) {
-  x <- x[!is.na(x)]
-  if (length(x) == 0) NA_real_ else x[[1]]
-}
-
-# =============================================================================
-# 1. Build one row per BeachData match that has rally Elo data
 #
-# Source relationship:
-# - matches$match_id and rallies_with_off_def_elo$match_id are the SAME
-#   BeachData match ID.
-# - matches contains mirrored +/- match IDs. Rally data uses the positive ID,
-#   so we retain positive matches only.
+# performance_data.qs is the canonical cleaned analytical dataset produced by
+# the beach pipeline. Upstream cleaning therefore stays in one place rather
+# than being reimplemented independently in this repo.
+#
+# Important Elo convention for this model:
+# - performance_data$team_elo_on_date / opp_elo_on_date represent the final
+#   daily Elo state attached by the production pipeline.
+# - To avoid same-day leakage, match Elo below uses the latest rating from a
+#   STRICTLY EARLIER DATE.
+# - Therefore all matches played by a team on the same date intentionally use
+#   the same pre-day Elo. A second match that day is slightly stale, but never
+#   contains information from that day's outcomes.
 # =============================================================================
 
-rally_match_ids <- rallies_with_off_def_elo %>%
-  distinct(match_id)
+tmp <- tempfile(fileext = ".qs")
 
-match_base <- matches %>%
-  filter(match_id > 0) %>%
-  semi_join(rally_match_ids, by = "match_id") %>%
+save_object(
+  object = "performance_data.qs",
+  bucket = "usavbeach",
+  file = tmp
+)
+
+performance_data <- qs_read(tmp)
+unlink(tmp)
+
+min_date <- as.Date("2023-01-01")
+
+# =============================================================================
+# 1. Keep one row per rally: the service row
+# =============================================================================
+#
+# One service row corresponds to one rally and carries:
+# - match / tournament metadata
+# - rally winner
+# - serving team in touch_team_name
+# - receiving team in opponent
+# - team_elo_on_date for the serving team
+# - opp_elo_on_date for the receiving team
+# - offense_elo for the receiving side BEFORE the rally
+# - defense_elo for the serving side BEFORE the rally
+#
+# Using service rows makes the match-level collapse simple and avoids weighting
+# rallies by their number of touches.
+# =============================================================================
+
+service_rows_all <- performance_data %>%
+  filter(touch_type == "service") %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date, match_id, set_num, rally_num)
+
+if (nrow(service_rows_all) == 0) {
+  stop("No service rows found in performance_data.qs.")
+}
+
+# =============================================================================
+# 2. Build leakage-free prior-day match Elo
+# =============================================================================
+#
+# performance_data contains both sides' daily Elo on every service row:
+# - touch_team_name / team_elo_on_date = serving side
+# - opponent / opp_elo_on_date         = receiving side
+#
+# First create one team rating per team/date. Then lag within team. Because the
+# lag is across DISTINCT dates, every match on a given day receives the rating
+# from that team's most recent earlier playing date.
+# =============================================================================
+
+team_day_elos <- bind_rows(
+  service_rows_all %>%
+    transmute(
+      date,
+      team = as.character(touch_team_name),
+      elo_on_date = as.numeric(team_elo_on_date)
+    ),
+  service_rows_all %>%
+    transmute(
+      date,
+      team = as.character(opponent),
+      elo_on_date = as.numeric(opp_elo_on_date)
+    )
+) %>%
+  filter(!is.na(team), team != "", !is.na(elo_on_date)) %>%
+  group_by(team, date) %>%
+  summarise(
+    elo_on_date = first(elo_on_date),
+    n_distinct_elos = n_distinct(elo_on_date),
+    .groups = "drop"
+  )
+
+inconsistent_team_day_elos <- team_day_elos %>%
+  filter(n_distinct_elos > 1L)
+
+if (nrow(inconsistent_team_day_elos) > 0) {
+  warning(
+    nrow(inconsistent_team_day_elos),
+    " team/date combinations contain multiple Elo values in performance_data."
+  )
+}
+
+team_day_elos <- team_day_elos %>%
+  arrange(team, date) %>%
+  group_by(team) %>%
   mutate(
-    date = as.Date(match_datetime),
-    gender_key = normalize_gender(gender),
-    tournament_key = normalize_tournament(tournament_name),
-    team_a_pair_key = pair_key(player_id_11, player_id_12),
-    team_b_pair_key = pair_key(player_id_21, player_id_22),
-    matchup_key = matchup_key(team_a_pair_key, team_b_pair_key),
+    prior_date = lag(date),
+    elo_pre_day = lag(elo_on_date)
+  ) %>%
+  ungroup()
+
+# =============================================================================
+# 3. Build one row per cleaned match
+# =============================================================================
+
+match_base <- service_rows_all %>%
+  filter(date >= min_date) %>%
+  group_by(match_id) %>%
+  summarise(
+    date = first(date),
+    gender = first(gender),
+    tournament_name = first(tournament_name),
+    team_a = first(team1_name),
+    team_b = first(team2_name),
+    match_winner = first(match_winner),
+    .groups = "drop"
+  ) %>%
+  mutate(
     team_a_win = case_when(
-      team1_score > team2_score ~ 1L,
-      team1_score < team2_score ~ 0L,
+      match_winner == team_a ~ 1L,
+      match_winner == team_b ~ 0L,
       TRUE ~ NA_integer_
     )
   )
 
 if (anyDuplicated(match_base$match_id) > 0) {
-  stop("match_base is not unique by positive BeachData match_id.")
+  stop("match_base is not one row per match_id.")
 }
 
-# Within an otherwise identical same-day matchup, BeachData provides an exact
-# match time. Tournament is deliberately excluded from the identity because
-# BeachData tournament names are presentation-friendly rather than raw FIVB
-# labels.
-match_base <- match_base %>%
-  arrange(date, gender_key, matchup_key, match_datetime, match_id) %>%
-  group_by(date, gender_key, matchup_key) %>%
-  mutate(matchup_occurrence = row_number()) %>%
-  ungroup()
-
 # =============================================================================
-# 2. Collapse rally Elo to pre-match team offense / defense Elo
+# 4. Point differential from rally winners
+# =============================================================================
+#
+# Because service_rows_all has exactly one row per rally, counting rally winners
+# is equivalent to counting points won.
 # =============================================================================
 
-rally_team_elos <- bind_rows(
-  rallies_with_off_def_elo %>%
-    transmute(
-      match_id,
-      date = as.Date(date),
-      set_num,
-      rally_num,
-      team_num = if_else(serving_team_num == 1L, 2L, 1L),
-      offense_elo,
-      defense_elo = NA_real_
-    ),
-  rallies_with_off_def_elo %>%
-    transmute(
-      match_id,
-      date = as.Date(date),
-      set_num,
-      rally_num,
-      team_num = as.integer(serving_team_num),
-      offense_elo = NA_real_,
-      defense_elo
-    )
-) %>%
-  arrange(match_id, set_num, rally_num) %>%
-  group_by(match_id, date, team_num) %>%
-  summarise(
-    offense_elo_pre = first_non_missing(offense_elo),
-    defense_elo_pre = first_non_missing(defense_elo),
-    .groups = "drop"
-  )
-
-rally_team_elo_wide <- rally_team_elos %>%
-  filter(team_num %in% c(1L, 2L)) %>%
-  select(match_id, team_num, offense_elo_pre, defense_elo_pre) %>%
-  pivot_wider(
-    names_from = team_num,
-    values_from = c(offense_elo_pre, defense_elo_pre),
-    names_glue = "{.value}_team{team_num}"
-  ) %>%
-  rename(
-    team_a_offense_elo_pre = offense_elo_pre_team1,
-    team_b_offense_elo_pre = offense_elo_pre_team2,
-    team_a_defense_elo_pre = defense_elo_pre_team1,
-    team_b_defense_elo_pre = defense_elo_pre_team2
-  )
-
-# =============================================================================
-# 3. Calculate total point differential from rally winners
-# =============================================================================
-
-rally_points <- rallies_with_off_def_elo %>%
-  filter(scoring_team_num %in% c(1L, 2L)) %>%
+rally_points <- service_rows_all %>%
+  filter(date >= min_date) %>%
   group_by(match_id) %>%
   summarise(
-    team_a_points = sum(scoring_team_num == 1L, na.rm = TRUE),
-    team_b_points = sum(scoring_team_num == 2L, na.rm = TRUE),
+    team_a_points = sum(rally_winner == first(team1_name), na.rm = TRUE),
+    team_b_points = sum(rally_winner == first(team2_name), na.rm = TRUE),
     point_differential = team_a_points - team_b_points,
     .groups = "drop"
   )
 
 # =============================================================================
-# 4. Collapse long_matches to exact FIVB/VIS match + team pre-match Elo
+# 5. Exact pre-match rally offense / defense Elo
+# =============================================================================
 #
-# FIVB/VIS match_id does NOT equal BeachData match_id.
-# Primary cross-system identity:
-#   date + gender + canonical four-player matchup + same-day occurrence
+# On a service row:
+# - defense_elo belongs to touch_team_name (the serving team)
+# - offense_elo belongs to opponent        (the receiving team)
 #
-# Tournament is retained for QA only and is not required to match.
+# The first time a team serves in a match gives its pre-match defense Elo.
+# The first time a team receives in a match gives its pre-match offense Elo.
 # =============================================================================
 
-long_matches_keyed <- long_matches %>%
-  mutate(
-    source_row = row_number(),
-    date = as.Date(date),
-    gender_key = normalize_gender(gender),
-    tournament_key = normalize_tournament(tourn),
-    team_pair_key = pair_key(athlete, partner),
-    opponent_pair_key = pair_key(opponent1, opponent2),
-    matchup_key = matchup_key(team_pair_key, opponent_pair_key)
-  )
-
-# One row per FIVB/VIS match, retaining chronological first-row position.
-long_match_index <- long_matches_keyed %>%
+rally_elos <- service_rows_all %>%
+  filter(date >= min_date) %>%
   group_by(match_id) %>%
   summarise(
-    date = first(date),
-    gender_key = first(gender_key),
-    long_tournament_key = first(tournament_key),
-    matchup_key = first(matchup_key),
-    long_source_order = min(source_row),
+    team_a = first(team1_name),
+    team_b = first(team2_name),
+
+    team_a_offense_elo_pre = first(
+      offense_elo[opponent == first(team1_name) & !is.na(offense_elo)],
+      default = NA_real_
+    ),
+    team_b_offense_elo_pre = first(
+      offense_elo[opponent == first(team2_name) & !is.na(offense_elo)],
+      default = NA_real_
+    ),
+
+    team_a_defense_elo_pre = first(
+      defense_elo[touch_team_name == first(team1_name) & !is.na(defense_elo)],
+      default = NA_real_
+    ),
+    team_b_defense_elo_pre = first(
+      defense_elo[touch_team_name == first(team2_name) & !is.na(defense_elo)],
+      default = NA_real_
+    ),
+
     .groups = "drop"
   ) %>%
-  arrange(date, gender_key, matchup_key, long_source_order, match_id) %>%
-  group_by(date, gender_key, matchup_key) %>%
-  mutate(matchup_occurrence = row_number()) %>%
-  ungroup() %>%
-  rename(long_match_id = match_id)
+  select(-team_a, -team_b)
 
-# Exact BeachData -> FIVB/VIS match crosswalk.
-match_crosswalk <- match_base %>%
-  select(
-    match_id,
+# =============================================================================
+# 6. Attach prior-day team Elo
+# =============================================================================
+
+team_a_prior_elo <- team_day_elos %>%
+  transmute(
     date,
-    gender_key,
-    tournament_key,
-    matchup_key,
-    matchup_occurrence
-  ) %>%
-  left_join(
-    long_match_index,
-    by = c(
-      "date",
-      "gender_key",
-      "matchup_key",
-      "matchup_occurrence"
-    )
+    team_a = team,
+    team_a_elo_pre = elo_pre_day,
+    team_a_elo_source_date = prior_date
   )
 
-if (anyDuplicated(match_crosswalk$match_id) > 0) {
-  stop("match_crosswalk is not unique by BeachData match_id.")
-}
-
-# Reduce the four athlete rows to one team Elo per team within each exact FIVB
-# match. athlete_elo_before is used deliberately to avoid post-match leakage.
-long_team_elos <- long_matches_keyed %>%
-  group_by(
-    long_match_id = match_id,
-    team_pair_key
-  ) %>%
-  summarise(
-    team_match_elo_pre = mean(athlete_elo_before, na.rm = TRUE),
-    athletes_in_team = n_distinct(athlete),
-    .groups = "drop"
+team_b_prior_elo <- team_day_elos %>%
+  transmute(
+    date,
+    team_b = team,
+    team_b_elo_pre = elo_pre_day,
+    team_b_elo_source_date = prior_date
   )
 
-bad_long_team_rows <- long_team_elos %>%
-  filter(athletes_in_team != 2L)
-
-if (nrow(bad_long_team_rows) > 0) {
-  warning(
-    nrow(bad_long_team_rows),
-    " long_matches match/team groups do not contain exactly two athletes."
-  )
-}
-
 # =============================================================================
-# 5. Attach exact pre-match match Elo to BeachData Team A and Team B
-# =============================================================================
-
-match_elos <- match_base %>%
-  select(match_id, team_a_pair_key, team_b_pair_key) %>%
-  left_join(
-    match_crosswalk %>% select(match_id, long_match_id),
-    by = "match_id"
-  ) %>%
-  left_join(
-    long_team_elos %>%
-      transmute(
-        long_match_id,
-        team_a_pair_key = team_pair_key,
-        team_a_elo_pre = team_match_elo_pre
-      ),
-    by = c("long_match_id", "team_a_pair_key")
-  ) %>%
-  left_join(
-    long_team_elos %>%
-      transmute(
-        long_match_id,
-        team_b_pair_key = team_pair_key,
-        team_b_elo_pre = team_match_elo_pre
-      ),
-    by = c("long_match_id", "team_b_pair_key")
-  ) %>%
-  select(match_id, long_match_id, team_a_elo_pre, team_b_elo_pre)
-
-# =============================================================================
-# 6. Assemble final modeling dataframe
+# 7. Assemble final modeling dataframe
 # =============================================================================
 
 model_df <- match_base %>%
   left_join(rally_points, by = "match_id") %>%
-  left_join(rally_team_elo_wide, by = "match_id") %>%
-  left_join(match_elos, by = "match_id") %>%
+  left_join(rally_elos, by = "match_id") %>%
   left_join(
-    rallies_with_off_def_elo %>%
-      arrange(match_id, set_num, rally_num) %>%
-      group_by(match_id) %>%
-      summarise(
-        team_a = first(team1_name),
-        team_b = first(team2_name),
-        .groups = "drop"
-      ),
-    by = "match_id"
+    team_a_prior_elo,
+    by = c("date", "team_a")
   ) %>%
-  mutate(
-    match_winner = case_when(
-      team_a_win == 1L ~ team_a,
-      team_a_win == 0L ~ team_b,
-      TRUE ~ NA_character_
-    )
+  left_join(
+    team_b_prior_elo,
+    by = c("date", "team_b")
   ) %>%
   transmute(
     date,
     match_id,
-    long_match_id,
     gender,
     tournament_name,
     team_a,
@@ -368,6 +265,8 @@ model_df <- match_base %>%
     point_differential,
     team_a_elo_pre,
     team_b_elo_pre,
+    team_a_elo_source_date,
+    team_b_elo_source_date,
     team_a_offense_elo_pre,
     team_b_offense_elo_pre,
     team_a_defense_elo_pre,
@@ -376,7 +275,7 @@ model_df <- match_base %>%
   arrange(date, match_id)
 
 # =============================================================================
-# 7. QA
+# 8. QA
 # =============================================================================
 
 if (anyDuplicated(model_df$match_id) > 0) {
@@ -385,49 +284,28 @@ if (anyDuplicated(model_df$match_id) > 0) {
 
 cat("\nLA28 model dataframe QA\n")
 cat("=======================\n")
+cat("Source: performance_data.qs\n")
 cat("Rows: ", format(nrow(model_df), big.mark = ","), "\n", sep = "")
-cat("Date range: ", format(min(model_df$date, na.rm = TRUE)), " to ", format(max(model_df$date, na.rm = TRUE)), "\n", sep = "")
-cat("Matched to exact FIVB/VIS match: ", sum(!is.na(model_df$long_match_id)), " / ", nrow(model_df), "\n", sep = "")
-cat("Missing match Elo A: ", sum(is.na(model_df$team_a_elo_pre)), "\n", sep = "")
-cat("Missing match Elo B: ", sum(is.na(model_df$team_b_elo_pre)), "\n", sep = "")
+cat(
+  "Date range: ",
+  format(min(model_df$date, na.rm = TRUE)),
+  " to ",
+  format(max(model_df$date, na.rm = TRUE)),
+  "\n",
+  sep = ""
+)
+cat("Missing outcome: ", sum(is.na(model_df$team_a_win)), "\n", sep = "")
+cat("Missing prior-day match Elo A: ", sum(is.na(model_df$team_a_elo_pre)), "\n", sep = "")
+cat("Missing prior-day match Elo B: ", sum(is.na(model_df$team_b_elo_pre)), "\n", sep = "")
 cat("Missing offense Elo A: ", sum(is.na(model_df$team_a_offense_elo_pre)), "\n", sep = "")
 cat("Missing offense Elo B: ", sum(is.na(model_df$team_b_offense_elo_pre)), "\n", sep = "")
 cat("Missing defense Elo A: ", sum(is.na(model_df$team_a_defense_elo_pre)), "\n", sep = "")
 cat("Missing defense Elo B: ", sum(is.na(model_df$team_b_defense_elo_pre)), "\n", sep = "")
 cat("Missing point differential: ", sum(is.na(model_df$point_differential)), "\n", sep = "")
+cat("Team/date Elo inconsistencies: ", nrow(inconsistent_team_day_elos), "\n", sep = "")
 
-# Useful diagnostics if exact-match linkage is incomplete.
-unmatched_crosswalk <- match_base %>%
-  select(
-    match_id,
-    match_datetime,
-    date,
-    gender,
-    tournament_name,
-    team_a_pair_key,
-    team_b_pair_key,
-    matchup_key,
-    matchup_occurrence
-  ) %>%
-  anti_join(
-    match_crosswalk %>% filter(!is.na(long_match_id)) %>% select(match_id),
-    by = "match_id"
-  )
-
-cat("Unmatched crosswalk rows: ", nrow(unmatched_crosswalk), "\n", sep = "")
-
-# Core-key duplicate diagnostics. These are worth inspecting if occurrence-based
-# matching remains incomplete, because multiple BeachData records can sometimes
-# represent the same underlying sporting match.
-beachdata_core_duplicates <- match_base %>%
-  count(date, gender_key, matchup_key, name = "n_beachdata") %>%
-  filter(n_beachdata > 1L)
-
-fivb_core_duplicates <- long_match_index %>%
-  count(date, gender_key, matchup_key, name = "n_fivb") %>%
-  filter(n_fivb > 1L)
-
-cat("BeachData core keys with >1 match: ", nrow(beachdata_core_duplicates), "\n", sep = "")
-cat("FIVB core keys with >1 match: ", nrow(fivb_core_duplicates), "\n", sep = "")
+cat("\nPrior-day Elo staleness (days since source rating)\n")
+cat("Team A median: ", median(as.integer(model_df$date - model_df$team_a_elo_source_date), na.rm = TRUE), "\n", sep = "")
+cat("Team B median: ", median(as.integer(model_df$date - model_df$team_b_elo_source_date), na.rm = TRUE), "\n", sep = "")
 
 print(head(model_df, 10))
