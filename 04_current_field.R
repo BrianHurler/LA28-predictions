@@ -21,9 +21,6 @@ if (!on_ec2) {
 # =============================================================================
 # Load current production data
 # =============================================================================
-# Future-match prediction uses each team's latest known state, not the
-# leakage-safe historical pre-match values used for model training.
-# =============================================================================
 
 if (!exists("performance_data")) {
   if (on_ec2) {
@@ -78,6 +75,27 @@ normalize_team_label <- function(x) {
     str_replace_all("[^a-z0-9]", "")
 }
 
+# Greedy duplicate-athlete resolver. Input must already be ordered by priority.
+# A partnership is kept only if neither athlete ID has already been used.
+remove_duplicate_athletes <- function(df, used_player_ids = character()) {
+  if (nrow(df) == 0) return(df)
+
+  keep <- logical(nrow(df))
+  used <- used_player_ids[!is.na(used_player_ids) & used_player_ids != ""]
+
+  for (i in seq_len(nrow(df))) {
+    ids <- c(df$player1_id[[i]], df$player2_id[[i]])
+    ids <- ids[!is.na(ids) & ids != ""]
+
+    if (!any(ids %in% used)) {
+      keep[[i]] <- TRUE
+      used <- unique(c(used, ids))
+    }
+  }
+
+  df[keep, , drop = FALSE]
+}
+
 # =============================================================================
 # 1. Latest observed overall Elo, federation, and partnership IDs
 # =============================================================================
@@ -93,6 +111,7 @@ if (nrow(service_rows) == 0) {
 
 latest_data_date <- max(service_rows$date, na.rm = TRUE)
 activity_window_start <- latest_data_date - 364
+active_since_date <- as.Date("2026-01-01")
 
 team_service_rows <- service_rows %>%
   mutate(
@@ -142,7 +161,12 @@ current_team_state <- team_service_rows %>%
   )
 
 # =============================================================================
-# 2. Count recent partnership matches
+# 2. Count recent partnership matches and define activity eligibility
+# =============================================================================
+# General field eligibility requires BOTH:
+#   - at least 15 distinct matches in the latest 365-day window; and
+#   - at least one observed match on or after 2026-01-01.
+# Known continental-berth teams bypass both activity requirements.
 # =============================================================================
 
 team_match_history <- service_rows %>%
@@ -173,7 +197,8 @@ current_team_state <- current_team_state %>%
   left_join(recent_match_counts, by = c("gender", "team")) %>%
   mutate(
     matches_last_365 = replace_na(matches_last_365, 0L),
-    activity_eligible = matches_last_365 >= 15L
+    played_in_2026 = last_observed_date >= active_since_date,
+    activity_eligible = matches_last_365 >= 15L & played_in_2026
   )
 
 # =============================================================================
@@ -244,6 +269,7 @@ current_team_state <- current_team_state %>%
     federation,
     last_observed_date,
     matches_last_365,
+    played_in_2026,
     activity_eligible,
     team_id,
     player1_id,
@@ -336,6 +362,7 @@ locked_existing <- continental_berth_qa %>%
     federation,
     last_observed_date,
     matches_last_365,
+    played_in_2026,
     activity_eligible,
     team_id,
     player1_id,
@@ -352,14 +379,13 @@ locked_existing <- continental_berth_qa %>%
     )
   )
 
-# Morocco's qualified partnership is absent from the dataset. Inject it manually
-# with neutral Elo values for every model input.
 locked_morocco <- tibble(
   gender = "male",
   team = "Elgraoui/El Gharouti",
   federation = "MAR",
   last_observed_date = as.Date(NA),
   matches_last_365 = 0L,
+  played_in_2026 = FALSE,
   activity_eligible = FALSE,
   team_id = NA_character_,
   player1_id = "150074",
@@ -374,6 +400,13 @@ locked_morocco <- tibble(
 
 locked_berths <- bind_rows(locked_existing, locked_morocco)
 
+locked_athletes <- locked_berths %>%
+  select(player1_id, player2_id) %>%
+  unlist(use.names = FALSE) %>%
+  as.character() %>%
+  discard(~ is.na(.x) || .x == "") %>%
+  unique()
+
 locked_federation_counts <- locked_berths %>%
   count(gender, federation, name = "locked_federation_teams")
 
@@ -384,11 +417,21 @@ if (any(locked_federation_counts$locked_federation_teams > 2L)) {
 # =============================================================================
 # 5. Build provisional 24-team Olympic field by gender
 # =============================================================================
+# Field rule:
+#   1. Lock all known continental berths into the field.
+#   2. For all other teams, require >=15 matches in the last 365 days.
+#   3. For all other teams, require at least one match on/after 2026-01-01.
+#   4. Remove duplicate-athlete partnerships, keeping the more recently active
+#      partnership by last_observed_date. Locked berth athletes are protected.
+#   5. Known berths count toward the maximum of two teams per federation.
+#   6. Fill remaining slots by latest overall Elo.
+#   7. Seed the completed field by overall Elo.
+# =============================================================================
 
 locked_keys <- locked_existing %>%
   transmute(gender, team_key = normalize_team_label(team))
 
-regular_candidates <- current_team_state %>%
+regular_candidates_pre_dedupe <- current_team_state %>%
   mutate(team_key = normalize_team_label(team)) %>%
   anti_join(locked_keys, by = c("gender", "team_key")) %>%
   filter(
@@ -397,6 +440,22 @@ regular_candidates <- current_team_state %>%
     !is.na(federation),
     federation != ""
   ) %>%
+  arrange(gender, desc(last_observed_date), desc(overall_elo), team)
+
+regular_candidates_deduped <- map_dfr(c("female", "male"), function(g) {
+  regular_candidates_pre_dedupe %>%
+    filter(gender == g) %>%
+    remove_duplicate_athletes(used_player_ids = locked_athletes)
+})
+
+duplicate_athlete_drops <- regular_candidates_pre_dedupe %>%
+  anti_join(
+    regular_candidates_deduped %>% select(gender, team),
+    by = c("gender", "team")
+  ) %>%
+  arrange(gender, desc(last_observed_date), team)
+
+regular_candidates <- regular_candidates_deduped %>%
   left_join(locked_federation_counts, by = c("gender", "federation")) %>%
   mutate(
     locked_federation_teams = replace_na(locked_federation_teams, 0L),
@@ -413,6 +472,7 @@ regular_candidates <- current_team_state %>%
     federation,
     last_observed_date,
     matches_last_365,
+    played_in_2026,
     activity_eligible,
     team_id,
     player1_id,
@@ -457,6 +517,7 @@ current_field <- field_by_gender %>%
     berth_source,
     last_observed_date,
     matches_last_365,
+    played_in_2026,
     activity_eligible,
     overall_elo,
     offense_elo,
@@ -470,8 +531,25 @@ current_field <- field_by_gender %>%
 field_counts <- current_field %>%
   count(gender, name = "n_teams")
 
+final_field_athletes <- current_field %>%
+  select(gender, team, player1_id, player2_id) %>%
+  pivot_longer(
+    cols = c(player1_id, player2_id),
+    names_to = "player_slot",
+    values_to = "player_id"
+  ) %>%
+  filter(!is.na(player_id), player_id != "")
+
+final_duplicate_athletes <- final_field_athletes %>%
+  count(gender, player_id, name = "n_teams") %>%
+  filter(n_teams > 1L)
+
+if (nrow(final_duplicate_athletes) > 0) {
+  stop("Duplicate athlete IDs remain in the final field. Inspect final_duplicate_athletes.")
+}
+
 if (any(field_counts$n_teams < 24L)) {
-  warning("At least one gender has fewer than 24 teams after berth, activity, and federation rules.")
+  warning("At least one gender has fewer than 24 teams after berth, activity, duplicate-athlete, and federation rules.")
 }
 
 if (any(is.na(current_field$offense_elo)) || any(is.na(current_field$defense_elo))) {
@@ -495,9 +573,13 @@ cat("==============================\n")
 cat("Latest data date: ", format(latest_data_date), "\n", sep = "")
 cat("365-day activity window: ", format(activity_window_start), " to ", format(latest_data_date), "\n", sep = "")
 cat("Minimum matches for non-berth field eligibility: 15\n")
+cat("Non-berth teams must have played on/after: ", format(active_since_date), "\n", sep = "")
 cat("Current team states: ", format(nrow(current_team_state), big.mark = ","), "\n", sep = "")
-cat("Activity-eligible teams: ", sum(current_team_state$activity_eligible), "\n", sep = "")
+cat("15-match eligible teams: ", sum(current_team_state$matches_last_365 >= 15L), "\n", sep = "")
+cat("Teams with a 2026 match: ", sum(current_team_state$played_in_2026, na.rm = TRUE), "\n", sep = "")
+cat("Fully activity-eligible teams: ", sum(current_team_state$activity_eligible, na.rm = TRUE), "\n", sep = "")
 cat("Known continental berths locked: ", nrow(locked_berths), "\n", sep = "")
+cat("Teams dropped for duplicate athlete ID: ", nrow(duplicate_athlete_drops), "\n", sep = "")
 cat("Teams with historical federation conflicts: ", nrow(current_federation_conflicts), "\n", sep = "")
 
 cat("\nKnown continental berth QA\n")
@@ -511,6 +593,7 @@ print(
       expected_federation,
       federation_source,
       matches_last_365,
+      last_observed_date,
       overall_elo,
       offense_elo,
       defense_elo,
@@ -524,6 +607,29 @@ print(
   locked_morocco %>%
     select(gender, team, federation, overall_elo, offense_elo, defense_elo)
 )
+
+cat("\nDuplicate-athlete partnership drops\n")
+if (nrow(duplicate_athlete_drops) == 0) {
+  cat("None\n")
+} else {
+  print(
+    duplicate_athlete_drops %>%
+      select(
+        gender,
+        team,
+        federation,
+        last_observed_date,
+        matches_last_365,
+        overall_elo,
+        player1_id,
+        player2_id
+      ),
+    n = Inf
+  )
+}
+
+cat("\nFinal duplicate-athlete QA\n")
+cat("Duplicate athlete IDs remaining: ", nrow(final_duplicate_athletes), "\n", sep = "")
 
 cat("\nField counts\n")
 print(field_counts)
@@ -542,6 +648,7 @@ print(
       team,
       federation,
       continental_berth,
+      last_observed_date,
       matches_last_365,
       overall_elo,
       offense_elo,
