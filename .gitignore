@@ -2,3 +2,7 @@
 .Rhistory
 .RData
 .Ruserdata
+
+# Generated local modeling artifacts
+data/*.qs
+data/*.parquet
