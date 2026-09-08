@@ -31,6 +31,10 @@ if (!on_ec2) {
 # the beach pipeline. It determines which matches enter this model and supplies
 # match metadata, outcomes, points, and daily match Elo.
 #
+# Loading convention for performance_data.qs:
+# - Local laptop: read the existing Desktop copy directly.
+# - EC2: download the current object from S3 and read that copy.
+#
 # rallies_with_off_def_elo.rda is used ONLY for rally-based offense / defense
 # Elo. It shares BeachData match_id with performance_data, so no cross-system
 # match mapping is required.
@@ -48,14 +52,18 @@ if (!on_ec2) {
 #   value of 1500.
 # =============================================================================
 
-tmp_performance <- tempfile(fileext = ".qs")
-save_object(
-  object = "performance_data.qs",
-  bucket = "usavbeach",
-  file = tmp_performance
-)
-performance_data <- qs_read(tmp_performance)
-unlink(tmp_performance)
+if (on_ec2) {
+  tmp_performance <- tempfile(fileext = ".qs")
+  save_object(
+    object = "performance_data.qs",
+    bucket = "usavbeach",
+    file = tmp_performance
+  )
+  performance_data <- qs_read(tmp_performance)
+  unlink(tmp_performance)
+} else {
+  performance_data <- qs_read("/Users/brianhurler/Desktop/performance_data.qs")
+}
 
 tmp_rally_elo <- tempfile(fileext = ".rda")
 save_object(
