@@ -2,6 +2,16 @@
 
 Predictive model for how beach volleyball teams will finish at the LA28 Olympics.
 
+## Script order
+
+The repository is organized as a sequential modeling workflow:
+
+1. `01_df_prep.R` — build and QA the historical match-level modeling dataset.
+2. `02_model_validation.R` — compare candidate match-win models using chronological out-of-time validation.
+3. `03_production_model.R` — fit the selected V0 model on the full usable historical dataset and save the fitted model for downstream simulation.
+
+Future scripts will continue this numbering for current-field construction and tournament simulation.
+
 ## Modeling architecture
 
 The project does **not** predict final Olympic finish directly.
@@ -20,7 +30,7 @@ The intended outputs include:
 
 ## Historical modeling data
 
-`df_prep.R` creates the historical match-level dataset.
+`01_df_prep.R` creates the historical match-level dataset.
 
 Current sources:
 
@@ -29,7 +39,7 @@ Current sources:
 
 Overall match Elo deliberately uses the latest rating from a **strictly earlier date**. This prevents same-day information leakage. On a team's first observed playing date, its pre-match Elo is initialized to 1500.
 
-Until upstream pipeline QA guarantees complete Elo coverage, `df_prep.R` creates a temporary complete-case dataset called `model_df_ready` and saves it to:
+Until upstream pipeline QA guarantees complete Elo coverage, `01_df_prep.R` creates a temporary complete-case dataset called `model_df_ready` and saves it to:
 
 ```text
 data/model_df_ready.qs
@@ -37,17 +47,67 @@ data/model_df_ready.qs
 
 The full `model_df` remains available in memory for QA; incomplete matches are excluded only from the temporary modeling population.
 
-## V0 predictive models
+Current usable modeling population:
 
-`model.R` begins with two logistic-regression models:
+- 9,008 total cleaned matches
+- 9,005 model-ready matches
+- 3 excluded matches, all due to missing outcomes
+- 0 missing overall match Elo after first-observed-day initialization
+- 0 missing offense Elo in the model-ready population
+- 0 missing defense Elo in the model-ready population
 
-**Model 0**
+Federation QA is retained because federation is needed later for the provisional two-teams-per-country field rule. Known upstream federation inconsistencies should be repaired in the production pipeline, but they do not block match-model development.
 
-```text
-team_a_win ~ overall Elo difference
-```
+## V0 predictive model validation
 
-**Model 1**
+`02_model_validation.R` compares four logistic-regression specifications:
+
+1. Overall Elo
+2. Overall Elo + offense Elo
+3. Overall Elo + defense Elo
+4. Overall Elo + offense Elo + defense Elo
+
+The primary V0 question is whether rally-derived offense and defense Elo improve out-of-time match prediction beyond overall match Elo alone.
+
+### 80/20 chronological holdout
+
+The first 80% of observed dates are used for training and the final 20% for testing. Matches from the same date remain on the same side of the split.
+
+| Model | Log loss | Brier |
+|---|---:|---:|
+| Overall Elo | 0.603 | 0.209 |
+| Overall + offense Elo | 0.592 | 0.204 |
+| Overall + defense Elo | 0.600 | 0.207 |
+| Overall + offense + defense Elo | **0.591** | **0.203** |
+
+The full model performed best on both metrics.
+
+### Expanding-window yearly holdouts
+
+The four models were also evaluated using expanding-window out-of-time validation:
+
+- 2024 holdout: train on 2023, test on 2024
+- 2025 holdout: train on 2023–2024, test on 2025
+- 2026 holdout: train on 2023–2025, test on available 2026 data
+
+The combined overall + offense + defense model improved on the overall-Elo-only baseline in **every holdout year** on both log loss and Brier score.
+
+| Holdout year | Log-loss improvement | Brier improvement |
+|---|---:|---:|
+| 2024 | 0.00890 | 0.00377 |
+| 2025 | 0.0107 | 0.00494 |
+| 2026 | 0.0129 | 0.00615 |
+
+Across all validation windows:
+
+- Overall Elo carried the majority of predictive signal.
+- Offense Elo added a meaningful and stable incremental improvement.
+- Defense Elo added a smaller but consistently positive improvement.
+- The full overall + offense + defense model performed best in every yearly holdout.
+
+### V0 model decision
+
+Based on the out-of-time validation results, the selected V0 match-win model is:
 
 ```text
 team_a_win ~ overall Elo difference
@@ -55,9 +115,13 @@ team_a_win ~ overall Elo difference
            + defense Elo difference
 ```
 
-The primary V0 question is whether rally-derived offense and defense Elo improve out-of-time match prediction beyond overall match Elo alone.
+`03_production_model.R` fits this specification on all 9,005 usable historical matches and saves the fitted model to:
 
-Validation is chronological. V0 uses the first 80% of observed dates for training and the final 20% for testing. Primary metrics are log loss, Brier score, and calibration.
+```text
+data/production_model.qs
+```
+
+This fitted model is the input to the next stage: constructing the current competitive field, generating pairwise win probabilities, and simulating the Olympic tournament.
 
 ---
 
