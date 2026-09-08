@@ -88,8 +88,6 @@ The 24 seeds are placed into six pools of four using the Paris-style serpentine 
 | E | 5, 8, 17, 20 |
 | F | 6, 7, 18, 19 |
 
-> Note: the original planning note listed Pool A as `1, 12, 13, 14`. Because seed 14 already belongs to Pool B and that would omit seed 24 entirely, V0 interprets the final Pool A seed as **24**. This also matches the Paris 2024 serpentine pool structure.
-
 Each pool is a four-team single round robin, so every team plays three pool matches.
 
 ## Advancement from pool play
