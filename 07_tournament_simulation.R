@@ -43,6 +43,51 @@ if (any(is.na(field_with_pool$pool))) {
 }
 
 # =============================================================================
+# Pairwise coverage QA
+# =============================================================================
+# Before any simulation begins, verify that every directed matchup implied by
+# the current 24-team field exists exactly once in the saved pairwise table.
+# This catches stale downstream files or team-label mismatches immediately.
+# =============================================================================
+
+expected_pairwise <- current_field %>%
+  select(gender, team) %>%
+  inner_join(
+    current_field %>% select(gender, team) %>% rename(team_b = team),
+    by = "gender"
+  ) %>%
+  rename(team_a = team) %>%
+  filter(team_a != team_b)
+
+pairwise_coverage <- expected_pairwise %>%
+  left_join(
+    pairwise_probabilities %>%
+      select(gender, team_a, team_b, win_probability),
+    by = c("gender", "team_a", "team_b")
+  )
+
+missing_pairwise <- pairwise_coverage %>%
+  filter(is.na(win_probability))
+
+if (nrow(missing_pairwise) > 0L) {
+  print(missing_pairwise, n = Inf)
+  stop(
+    "Pairwise table does not cover the finalized current field. ",
+    "Rerun 05_pairwise_probabilities.R after the latest 04_current_field.R."
+  )
+}
+
+pairwise_duplicate_qa <- pairwise_probabilities %>%
+  semi_join(expected_pairwise, by = c("gender", "team_a", "team_b")) %>%
+  count(gender, team_a, team_b) %>%
+  filter(n != 1L)
+
+if (nrow(pairwise_duplicate_qa) > 0L) {
+  print(pairwise_duplicate_qa, n = Inf)
+  stop("At least one current-field pairwise matchup is not represented exactly once.")
+}
+
+# =============================================================================
 # Helpers
 # =============================================================================
 
@@ -67,9 +112,9 @@ probability_bin <- function(p) {
 lookup_win_probability <- function(gender, team_a, team_b) {
   x <- pairwise_probabilities %>%
     filter(
-      .data$gender == gender,
-      .data$team_a == team_a,
-      .data$team_b == team_b
+      .data$gender == .env$gender,
+      .data$team_a == .env$team_a,
+      .data$team_b == .env$team_b
     ) %>%
     pull(win_probability)
 
@@ -85,12 +130,13 @@ sample_scoreline <- function(gender, winner_probability) {
 
   candidates <- scoreline_library %>%
     filter(
-      .data$gender == gender,
-      as.character(winner_probability_bin) == target_bin
+      .data$gender == .env$gender,
+      as.character(.data$winner_probability_bin) == .env$target_bin
     )
 
   if (nrow(candidates) == 0L) {
-    candidates <- scoreline_library %>% filter(.data$gender == gender)
+    candidates <- scoreline_library %>%
+      filter(.data$gender == .env$gender)
   }
 
   candidates %>%
@@ -239,13 +285,14 @@ valid_runner_draw <- function(runners) {
 }
 
 simulate_gender_tournament <- function(gender) {
-  field_g <- field_with_pool %>% filter(.data$gender == gender)
+  field_g <- field_with_pool %>%
+    filter(.data$gender == .env$gender)
 
   pool_results <- map(set_names(LETTERS[1:6]), function(pool_name) {
     simulate_pool(
       gender,
       pool_name,
-      field_g %>% filter(pool == pool_name)
+      field_g %>% filter(.data$pool == .env$pool_name)
     )
   })
 
@@ -377,6 +424,7 @@ cat("\nLA28 tournament simulation\n")
 cat("==========================\n")
 cat("Simulations per gender: ", format(N_SIM, big.mark = ","), "\n", sep = "")
 cat("Random seed: ", SIM_SEED, "\n", sep = "")
+cat("Pairwise coverage QA: complete for all current-field directed matchups\n")
 
 simulation_results <- map_dfr(c("female", "male"), function(g) {
   cat("Running ", g, " simulations...\n", sep = "")
