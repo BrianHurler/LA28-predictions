@@ -21,12 +21,8 @@ if (!on_ec2) {
 # =============================================================================
 # Load current production data
 # =============================================================================
-# For future-match prediction we want each team's LATEST known state, not the
-# leakage-safe prior-day values used to train and validate the historical model.
-#
-# Overall Elo comes from the latest team_elo_on_date in performance_data.qs.
-# Current offense / defense Elo comes from the current off_def_elo_ratings.rda
-# snapshot and is calculated as the mean of the two partners' player ratings.
+# Future-match prediction uses each team's latest known state, not the
+# leakage-safe historical pre-match values used for model training.
 # =============================================================================
 
 if (on_ec2) {
@@ -71,11 +67,15 @@ last_non_missing_num <- function(x) {
   if (length(x) == 0) NA_real_ else x[[length(x)]]
 }
 
+normalize_team_label <- function(x) {
+  x %>%
+    stringi::stri_trans_general("Latin-ASCII") %>%
+    str_to_lower() %>%
+    str_replace_all("[^a-z0-9]", "")
+}
+
 # =============================================================================
 # 1. Latest observed overall Elo, federation, and partnership IDs
-# =============================================================================
-# Every team serves during a normal match, so service rows provide a clean way
-# to identify the team represented by federation and team_elo_on_date.
 # =============================================================================
 
 service_rows <- performance_data %>%
@@ -113,8 +113,6 @@ team_service_rows <- service_rows %>%
   ) %>%
   filter(!is.na(team), team != "")
 
-# Federation QA remains visible here because the Olympic field enforces a
-# maximum of two teams per federation.
 current_federation_conflicts <- team_service_rows %>%
   filter(!is.na(federation), federation != "") %>%
   distinct(team, federation) %>%
@@ -142,9 +140,8 @@ current_team_state <- team_service_rows %>%
 # =============================================================================
 # 2. Count recent partnership matches
 # =============================================================================
-# Field eligibility requires at least 15 matches in the most recent 365-day
-# window available in the dataset. Count distinct match_id values so each match
-# counts once regardless of number of sets or rallies.
+# General field eligibility requires at least 15 distinct matches in the most
+# recent 365-day window. Known continental-berth teams bypass this threshold.
 # =============================================================================
 
 team_match_history <- service_rows %>%
@@ -180,11 +177,6 @@ current_team_state <- current_team_state %>%
 
 # =============================================================================
 # 3. Attach CURRENT offense and defense Elo
-# =============================================================================
-# The rally Elo system tracks player-level offense and defense ratings whenever
-# player IDs are available. The team rating used by the model is the average of
-# the two partners. If player ratings are unavailable, retain the team-level
-# rating snapshot as a fallback rather than silently inventing a value.
 # =============================================================================
 
 player_ratings <- ratings %>%
@@ -262,32 +254,192 @@ current_team_state <- current_team_state %>%
   )
 
 # =============================================================================
-# 4. Build provisional 24-team Olympic field by gender
+# 4. Known continental berths
 # =============================================================================
-# V0 field rule:
-#   1. Team must have played at least 15 matches in the last 365 days.
-#   2. Rank eligible teams by most recent overall Elo.
-#   3. Maximum two teams per federation.
-#   4. Take the top 24 remaining teams for each gender.
+# These partnerships are locked into the provisional Olympic field regardless
+# of the 15-match activity threshold. The seven existing partnerships must be
+# present in current_team_state with federation and all three Elo ratings.
 # =============================================================================
 
-field_candidates <- current_team_state %>%
+continental_berths_existing <- tribble(
+  ~berth_team,                       ~expected_gender,
+  "Andre/Renato",                   "male",
+  "Victoria/Thamela",               "female",
+  "Stam/Schoon",                    "female",
+  "Andersson, E/Hölting Nilsson",   "male",
+  "Nicolaidis/Carracher",           "male",
+  "Clancy/Fejes",                   "female",
+  "Pamela/Esther M",                "female"
+) %>%
+  mutate(team_key = normalize_team_label(berth_team))
+
+continental_lookup <- current_team_state %>%
+  mutate(team_key = normalize_team_label(team)) %>%
+  select(team_key, everything())
+
+continental_berth_qa <- continental_berths_existing %>%
+  left_join(continental_lookup, by = "team_key") %>%
+  mutate(
+    found = !is.na(team),
+    gender_ok = found & gender == expected_gender,
+    federation_ok = found & !is.na(federation) & federation != "",
+    overall_elo_ok = found & !is.na(overall_elo),
+    offense_elo_ok = found & !is.na(offense_elo),
+    defense_elo_ok = found & !is.na(defense_elo),
+    qa_pass = found & gender_ok & federation_ok & overall_elo_ok &
+      offense_elo_ok & defense_elo_ok
+  )
+
+if (anyDuplicated(continental_berth_qa$berth_team) > 0) {
+  stop("Continental berth lookup produced duplicate rows for a requested team.")
+}
+
+if (any(!continental_berth_qa$qa_pass)) {
+  cat("\nContinental berth QA FAILED\n")
+  print(
+    continental_berth_qa %>%
+      select(
+        berth_team,
+        expected_gender,
+        team,
+        gender,
+        federation,
+        overall_elo,
+        offense_elo,
+        defense_elo,
+        found,
+        gender_ok,
+        federation_ok,
+        overall_elo_ok,
+        offense_elo_ok,
+        defense_elo_ok,
+        qa_pass
+      ),
+    n = Inf
+  )
+  stop("At least one known continental-berth team failed dataset/Elo/federation QA.")
+}
+
+locked_existing <- continental_berth_qa %>%
+  transmute(
+    gender,
+    team,
+    federation,
+    last_observed_date,
+    matches_last_365,
+    activity_eligible,
+    team_id,
+    player1_id,
+    player2_id,
+    overall_elo,
+    offense_elo,
+    defense_elo,
+    rally_elo_source,
+    continental_berth = TRUE,
+    berth_source = "known continental berth"
+  )
+
+# Morocco's continental berth is not represented as this partnership in the
+# current dataset. Use neutral 1500 ratings for all three model inputs.
+locked_morocco <- tibble(
+  gender = "male",
+  team = "Elgraoui/El Gharouti",
+  federation = "MAR",
+  last_observed_date = as.Date(NA),
+  matches_last_365 = 0L,
+  activity_eligible = FALSE,
+  team_id = NA_character_,
+  player1_id = "150074",
+  player2_id = "161541",
+  overall_elo = 1500,
+  offense_elo = 1500,
+  defense_elo = 1500,
+  rally_elo_source = "hard-coded 1500",
+  continental_berth = TRUE,
+  berth_source = "known continental berth - manual team"
+)
+
+locked_berths <- bind_rows(locked_existing, locked_morocco)
+
+locked_federation_counts <- locked_berths %>%
+  count(gender, federation, name = "locked_federation_teams")
+
+if (any(locked_federation_counts$locked_federation_teams > 2L)) {
+  warning("Known continental berths exceed the two-team federation cap for at least one gender/federation.")
+}
+
+# =============================================================================
+# 5. Build provisional 24-team Olympic field by gender
+# =============================================================================
+# Field rule:
+#   1. Lock all known continental berths into the field.
+#   2. For all other teams, require >=15 matches in the last 365 days.
+#   3. Known berths count toward the maximum of two teams per federation.
+#   4. Fill remaining slots by latest overall Elo.
+#   5. Seed the completed 24-team field by overall Elo.
+# =============================================================================
+
+locked_keys <- locked_existing %>%
+  transmute(gender, team_key = normalize_team_label(team))
+
+regular_candidates <- current_team_state %>%
+  mutate(team_key = normalize_team_label(team)) %>%
+  anti_join(locked_keys, by = c("gender", "team_key")) %>%
   filter(
     activity_eligible,
     !is.na(overall_elo),
     !is.na(federation),
     federation != ""
   ) %>%
-  arrange(gender, desc(overall_elo), team) %>%
+  left_join(locked_federation_counts, by = c("gender", "federation")) %>%
+  mutate(
+    locked_federation_teams = replace_na(locked_federation_teams, 0L),
+    federation_slots_remaining = pmax(0L, 2L - locked_federation_teams)
+  ) %>%
+  arrange(gender, federation, desc(overall_elo), team) %>%
   group_by(gender, federation) %>%
-  mutate(federation_rank = row_number()) %>%
+  mutate(federation_candidate_rank = row_number()) %>%
   ungroup() %>%
-  filter(federation_rank <= 2L) %>%
-  arrange(gender, desc(overall_elo), team)
+  filter(federation_candidate_rank <= federation_slots_remaining) %>%
+  transmute(
+    gender,
+    team,
+    federation,
+    last_observed_date,
+    matches_last_365,
+    activity_eligible,
+    team_id,
+    player1_id,
+    player2_id,
+    overall_elo,
+    offense_elo,
+    defense_elo,
+    rally_elo_source,
+    continental_berth = FALSE,
+    berth_source = NA_character_
+  )
 
-current_field <- field_candidates %>%
+field_by_gender <- map_dfr(c("female", "male"), function(g) {
+  locked_g <- locked_berths %>% filter(gender == g)
+  regular_g <- regular_candidates %>%
+    filter(gender == g) %>%
+    arrange(desc(overall_elo), team)
+
+  n_regular_needed <- 24L - nrow(locked_g)
+
+  if (n_regular_needed < 0L) {
+    stop("More than 24 locked berth teams found for gender: ", g)
+  }
+
+  bind_rows(
+    locked_g,
+    regular_g %>% slice_head(n = n_regular_needed)
+  )
+})
+
+current_field <- field_by_gender %>%
+  arrange(gender, desc(overall_elo), team) %>%
   group_by(gender) %>%
-  slice_head(n = 24) %>%
   mutate(seed = row_number()) %>%
   ungroup() %>%
   select(
@@ -295,8 +447,11 @@ current_field <- field_candidates %>%
     seed,
     team,
     federation,
+    continental_berth,
+    berth_source,
     last_observed_date,
     matches_last_365,
+    activity_eligible,
     overall_elo,
     offense_elo,
     defense_elo,
@@ -310,18 +465,15 @@ field_counts <- current_field %>%
   count(gender, name = "n_teams")
 
 if (any(field_counts$n_teams < 24L)) {
-  warning("At least one gender has fewer than 24 eligible teams after activity and federation filtering.")
+  warning("At least one gender has fewer than 24 teams after berth, activity, and federation rules.")
 }
 
 if (any(is.na(current_field$offense_elo)) || any(is.na(current_field$defense_elo))) {
-  warning(
-    "At least one selected field team is missing current offense/defense Elo. ",
-    "Inspect current_field before simulation."
-  )
+  warning("At least one selected field team is missing current offense/defense Elo.")
 }
 
 # =============================================================================
-# 5. Save downstream inputs
+# 6. Save downstream inputs
 # =============================================================================
 
 dir.create("data", showWarnings = FALSE, recursive = TRUE)
@@ -329,22 +481,41 @@ qs_save(current_team_state, "data/current_team_state.qs")
 qs_save(current_field, "data/current_field.qs")
 
 # =============================================================================
-# 6. QA / inspection
+# 7. QA / inspection
 # =============================================================================
 
 cat("\nLA28 provisional current field\n")
 cat("==============================\n")
 cat("Latest data date: ", format(latest_data_date), "\n", sep = "")
 cat("365-day activity window: ", format(activity_window_start), " to ", format(latest_data_date), "\n", sep = "")
-cat("Minimum matches for field eligibility: 15\n")
+cat("Minimum matches for non-berth field eligibility: 15\n")
 cat("Current team states: ", format(nrow(current_team_state), big.mark = ","), "\n", sep = "")
 cat("Activity-eligible teams: ", sum(current_team_state$activity_eligible), "\n", sep = "")
-cat("Teams excluded for <15 matches: ", sum(!current_team_state$activity_eligible), "\n", sep = "")
+cat("Known continental berths locked: ", nrow(locked_berths), "\n", sep = "")
 cat("Teams with historical federation conflicts: ", nrow(current_federation_conflicts), "\n", sep = "")
-cat("Missing latest federation: ", sum(is.na(current_team_state$federation)), "\n", sep = "")
-cat("Missing latest overall Elo: ", sum(is.na(current_team_state$overall_elo)), "\n", sep = "")
-cat("Missing current offense Elo: ", sum(is.na(current_team_state$offense_elo)), "\n", sep = "")
-cat("Missing current defense Elo: ", sum(is.na(current_team_state$defense_elo)), "\n", sep = "")
+
+cat("\nKnown continental berth QA\n")
+print(
+  continental_berth_qa %>%
+    select(
+      berth_team,
+      team,
+      gender,
+      federation,
+      matches_last_365,
+      overall_elo,
+      offense_elo,
+      defense_elo,
+      qa_pass
+    ),
+  n = Inf
+)
+
+cat("\nManual continental berth\n")
+print(
+  locked_morocco %>%
+    select(gender, team, federation, overall_elo, offense_elo, defense_elo)
+)
 
 cat("\nField counts\n")
 print(field_counts)
@@ -362,7 +533,7 @@ print(
       seed,
       team,
       federation,
-      last_observed_date,
+      continental_berth,
       matches_last_365,
       overall_elo,
       offense_elo,
