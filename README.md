@@ -133,7 +133,7 @@ The LA28 qualification pathway is not yet known in final detail, so the first si
 `04_current_field.R` builds that field from current production data. Historical model fitting uses leakage-safe pre-match ratings, but future-match prediction uses each partnership's **latest known state**:
 
 - current overall Elo from the latest `team_elo_on_date` in `performance_data.qs`;
-- current offense and defense Elo from `off_def_elo_ratings.rda`, using the mean of the two partners' player ratings where available;
+- current offense and defense Elo from `rallies_with_off_def_elo.rda`, using each partnership's most recently observed rally-level offense/defense Elo (the same source and team-attribution convention -- receiving team = offense, serving team = defense -- used for historical model fitting, so offense/defense Elo is on the same scale at fit time and at simulation time);
 - latest observed federation and partnership identifiers from `performance_data.qs`.
 
 For **each gender separately**:
