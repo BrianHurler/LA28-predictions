@@ -13,6 +13,15 @@ The repository is organized as a sequential modeling workflow:
 
 Future scripts will continue this numbering for pairwise win probabilities and tournament simulation.
 
+## Running locally
+
+Open `LA28-predictions.Rproj` in RStudio before running any script -- this sets the working directory to the project root, which the relative `data/...` read/write paths throughout the pipeline depend on. This works the same way on both Mac and Windows.
+
+Each script auto-detects whether it's running on the EC2 production host (`on_ec2`, based on standard EC2 metadata files) or on a local laptop:
+
+- On EC2, source data (`performance_data.qs`, `rallies_with_off_def_elo.rda`) is downloaded from the `usavbeach` S3 bucket.
+- Locally, `performance_data.qs` is expected on the current user's Desktop (`~/Desktop/performance_data.qs`), resolved via `USERPROFILE` on Windows and `HOME` on Mac -- no machine-specific path is hard-coded, so this works for any user on either OS.
+
 ## Modeling architecture
 
 The project does **not** predict final Olympic finish directly.

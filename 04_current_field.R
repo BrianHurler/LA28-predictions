@@ -21,6 +21,17 @@ if (!on_ec2) {
 # =============================================================================
 # Load current production data
 # =============================================================================
+# Local laptop (Mac or Windows): read performance_data.qs from the current
+# user's Desktop folder. Assumes the project was opened via
+# LA28-predictions.Rproj (RStudio sets the working directory to the project
+# root on open). EC2: download the current performance_data.qs object from S3.
+# =============================================================================
+
+local_performance_data_path <- file.path(
+  if (.Platform$OS.type == "windows") Sys.getenv("USERPROFILE") else Sys.getenv("HOME"),
+  "Desktop",
+  "performance_data.qs"
+)
 
 if (!exists("performance_data")) {
   if (on_ec2) {
@@ -33,7 +44,13 @@ if (!exists("performance_data")) {
     performance_data <- qs_read(tmp_performance)
     unlink(tmp_performance)
   } else {
-    performance_data <- qs_read("/Users/brianhurler/Desktop/performance_data.qs")
+    if (!file.exists(local_performance_data_path)) {
+      stop(
+        "performance_data.qs not found at: ", local_performance_data_path,
+        ". Place performance_data.qs on your Desktop, or set on_ec2 workflow instead."
+      )
+    }
+    performance_data <- qs_read(local_performance_data_path)
   }
 } else {
   message("performance_data already loaded; skipping reload.")
