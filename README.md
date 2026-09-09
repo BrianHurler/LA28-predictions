@@ -13,6 +13,15 @@ The repository is organized as a sequential modeling workflow:
 
 Future scripts will continue this numbering for pairwise win probabilities and tournament simulation.
 
+## Running locally
+
+Open `LA28-predictions.Rproj` in RStudio before running any script -- this sets the working directory to the project root, which the relative `data/...` read/write paths throughout the pipeline depend on. This works the same way on both Mac and Windows.
+
+Each script auto-detects whether it's running on the EC2 production host (`on_ec2`, based on standard EC2 metadata files) or on a local laptop:
+
+- On EC2, source data (`performance_data.qs`, `rallies_with_off_def_elo.rda`) is downloaded from the `usavbeach` S3 bucket.
+- Locally, `performance_data.qs` is expected on the current user's Desktop (`~/Desktop/performance_data.qs`), resolved via `USERPROFILE` on Windows and `HOME` on Mac -- no machine-specific path is hard-coded, so this works for any user on either OS.
+
 ## Modeling architecture
 
 The project does **not** predict final Olympic finish directly.
@@ -133,7 +142,7 @@ The LA28 qualification pathway is not yet known in final detail, so the first si
 `04_current_field.R` builds that field from current production data. Historical model fitting uses leakage-safe pre-match ratings, but future-match prediction uses each partnership's **latest known state**:
 
 - current overall Elo from the latest `team_elo_on_date` in `performance_data.qs`;
-- current offense and defense Elo from `off_def_elo_ratings.rda`, using the mean of the two partners' player ratings where available;
+- current offense and defense Elo from `rallies_with_off_def_elo.rda`, using each partnership's most recently observed rally-level offense/defense Elo (the same source and team-attribution convention -- receiving team = offense, serving team = defense -- used for historical model fitting, so offense/defense Elo is on the same scale at fit time and at simulation time);
 - latest observed federation and partnership identifiers from `performance_data.qs`.
 
 For **each gender separately**:

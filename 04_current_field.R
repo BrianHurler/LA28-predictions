@@ -21,6 +21,17 @@ if (!on_ec2) {
 # =============================================================================
 # Load current production data
 # =============================================================================
+# Local laptop (Mac or Windows): read performance_data.qs from the current
+# user's Desktop folder. Assumes the project was opened via
+# LA28-predictions.Rproj (RStudio sets the working directory to the project
+# root on open). EC2: download the current performance_data.qs object from S3.
+# =============================================================================
+
+local_performance_data_path <- file.path(
+  if (.Platform$OS.type == "windows") Sys.getenv("USERPROFILE") else Sys.getenv("HOME"),
+  "Desktop",
+  "performance_data.qs"
+)
 
 if (!exists("performance_data")) {
   if (on_ec2) {
@@ -33,23 +44,29 @@ if (!exists("performance_data")) {
     performance_data <- qs_read(tmp_performance)
     unlink(tmp_performance)
   } else {
-    performance_data <- qs_read("/Users/brianhurler/Desktop/performance_data.qs")
+    if (!file.exists(local_performance_data_path)) {
+      stop(
+        "performance_data.qs not found at: ", local_performance_data_path,
+        ". Place performance_data.qs on your Desktop, or set on_ec2 workflow instead."
+      )
+    }
+    performance_data <- qs_read(local_performance_data_path)
   }
 } else {
   message("performance_data already loaded; skipping reload.")
 }
 
-tmp_ratings <- tempfile(fileext = ".rda")
+tmp_rally_elo <- tempfile(fileext = ".rda")
 save_object(
-  object = "off_def_elo_ratings.rda",
+  object = "rallies_with_off_def_elo.rda",
   bucket = "usavbeach",
-  file = tmp_ratings
+  file = tmp_rally_elo
 )
-load(tmp_ratings)
-unlink(tmp_ratings)
+load(tmp_rally_elo)
+unlink(tmp_rally_elo)
 
-if (!exists("ratings")) {
-  stop("off_def_elo_ratings.rda did not contain an object named ratings.")
+if (!exists("rallies_with_off_def_elo")) {
+  stop("rallies_with_off_def_elo.rda did not contain an object named rallies_with_off_def_elo.")
 }
 
 # =============================================================================
@@ -204,62 +221,96 @@ current_team_state <- current_team_state %>%
 # =============================================================================
 # 3. Attach CURRENT offense and defense Elo
 # =============================================================================
+# Uses the SAME upstream source and team-attribution convention as
+# 01_df_prep.R section 6 (rallies_with_off_def_elo.rda: offense_elo is
+# attributed to the receiving team, defense_elo to the serving team).
+#
+# 01_df_prep.R takes each match's FIRST non-missing rally value (a
+# leakage-safe pre-match snapshot for historical model fitting). Here we
+# instead take each team's LAST non-missing value across its entire
+# observed history -- the most current known offense/defense Elo state --
+# matching the "latest observed" convention already used above for
+# overall_elo (last_non_missing_num()). This keeps offense/defense Elo on
+# the exact same rating scale at fit time and at simulation time.
+# =============================================================================
 
-player_ratings <- ratings %>%
-  filter(kind == "player") %>%
+match_team_lookup <- bind_rows(
+  service_rows %>%
+    distinct(match_id, date, gender, team1_name, team2_name) %>%
+    transmute(
+      match_id, date, gender,
+      team_num = 1L,
+      team = as.character(team1_name)
+    ),
+  service_rows %>%
+    distinct(match_id, date, gender, team1_name, team2_name) %>%
+    transmute(
+      match_id, date, gender,
+      team_num = 2L,
+      team = as.character(team2_name)
+    )
+) %>%
+  filter(!is.na(team), team != "")
+
+rally_elo_current_base <- rallies_with_off_def_elo %>%
+  mutate(date = as.Date(date)) %>%
+  arrange(date, match_id, set_num, rally_num)
+
+rally_offense_rows_current <- rally_elo_current_base %>%
   transmute(
-    player_id = as.character(id),
-    offensive_elo = as.numeric(offensive_elo),
-    defensive_elo = as.numeric(defensive_elo)
+    match_id, set_num, rally_num,
+    team_num = if_else(serving_team_num == 1L, 2L, 1L),
+    rating = as.numeric(offense_elo),
+    rating_type = "offense"
   )
 
-team_ratings <- ratings %>%
-  filter(kind == "team") %>%
+rally_defense_rows_current <- rally_elo_current_base %>%
   transmute(
-    team_id = as.character(id),
-    team_offensive_elo = as.numeric(offensive_elo),
-    team_defensive_elo = as.numeric(defensive_elo)
+    match_id, set_num, rally_num,
+    team_num = as.integer(serving_team_num),
+    rating = as.numeric(defense_elo),
+    rating_type = "defense"
+  )
+
+rally_ratings_current <- bind_rows(
+  rally_offense_rows_current,
+  rally_defense_rows_current
+) %>%
+  filter(!is.na(rating)) %>%
+  left_join(match_team_lookup, by = c("match_id", "team_num")) %>%
+  filter(!is.na(team), team != "")
+
+if (nrow(rally_ratings_current) == 0) {
+  stop("No usable rows after mapping rallies_with_off_def_elo.rda team_num to team names.")
+}
+
+latest_off_def_elo <- rally_ratings_current %>%
+  arrange(gender, team, rating_type, date, match_id, set_num, rally_num) %>%
+  group_by(gender, team, rating_type) %>%
+  summarise(
+    rating = last(rating),
+    rating_source_date = last(date),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    id_cols = c(gender, team),
+    names_from = rating_type,
+    values_from = c(rating, rating_source_date),
+    names_glue = "{rating_type}_{.value}"
+  ) %>%
+  rename(
+    offense_elo = offense_rating,
+    defense_elo = defense_rating,
+    offense_elo_source_date = offense_rating_source_date,
+    defense_elo_source_date = defense_rating_source_date
   )
 
 current_team_state <- current_team_state %>%
-  left_join(
-    player_ratings %>%
-      rename(
-        player1_id = player_id,
-        player1_offensive_elo = offensive_elo,
-        player1_defensive_elo = defensive_elo
-      ),
-    by = "player1_id"
-  ) %>%
-  left_join(
-    player_ratings %>%
-      rename(
-        player2_id = player_id,
-        player2_offensive_elo = offensive_elo,
-        player2_defensive_elo = defensive_elo
-      ),
-    by = "player2_id"
-  ) %>%
-  left_join(team_ratings, by = "team_id") %>%
+  left_join(latest_off_def_elo, by = c("gender", "team")) %>%
   mutate(
-    offense_elo = case_when(
-      !is.na(player1_offensive_elo) & !is.na(player2_offensive_elo) ~
-        (player1_offensive_elo + player2_offensive_elo) / 2,
-      !is.na(team_offensive_elo) ~ team_offensive_elo,
-      TRUE ~ NA_real_
-    ),
-    defense_elo = case_when(
-      !is.na(player1_defensive_elo) & !is.na(player2_defensive_elo) ~
-        (player1_defensive_elo + player2_defensive_elo) / 2,
-      !is.na(team_defensive_elo) ~ team_defensive_elo,
-      TRUE ~ NA_real_
-    ),
     rally_elo_source = case_when(
-      !is.na(player1_offensive_elo) & !is.na(player2_offensive_elo) &
-        !is.na(player1_defensive_elo) & !is.na(player2_defensive_elo) ~
-        "player average",
-      !is.na(team_offensive_elo) & !is.na(team_defensive_elo) ~
-        "team fallback",
+      !is.na(offense_elo) & !is.na(defense_elo) ~
+        "rallies_with_off_def_elo (latest observed rally)",
       TRUE ~ "missing"
     )
   ) %>%
@@ -277,6 +328,8 @@ current_team_state <- current_team_state %>%
     overall_elo,
     offense_elo,
     defense_elo,
+    offense_elo_source_date,
+    defense_elo_source_date,
     rally_elo_source
   )
 
